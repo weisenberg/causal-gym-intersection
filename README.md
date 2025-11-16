@@ -392,7 +392,6 @@ gym-causal-intersection/
 
 ## License
 
-[Specify your license here]
 
 ## Citation
 
@@ -401,8 +400,8 @@ If you use this environment in your research, please cite:
 ```bibtex
 @software{gym_causal_intersection,
   title={Gym Causal Intersection: A Reinforcement Learning Environment for Urban Traffic},
-  author={[Your Name]},
-  year={2024},
-  url={[Your Repository URL]}
+  author={[Ali Khadangi]},
+  year={2025},
+  url={[https://github.com/weisenberg/causal-gym-intersection]}
 }
 ```
