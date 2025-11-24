@@ -47,7 +47,14 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             "num_pedestrians": 15,
             "jaywalk_probability": 0.1,
             "npc_car_spawn_rate": 0.02,
-            "num_npc_cars": 20
+            "num_npc_cars": 20,
+            "temperature": 20,
+            "roughness": 0.0,
+            "traffic_density": "medium",
+            "pedestrian_density": "medium",
+            "driver_impatience": 0.5,
+            "npc_color": "random",
+            "npc_size": "random"
         }
         
         # --- Define Spaces ---
@@ -318,6 +325,89 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         # Store agent direction for traffic light checking (if needed)
         self._agent_direction = spawn.get("direction", "east")
         
+        self._agent_direction = spawn.get("direction", "east")
+        
+        # --- Causal RL: Domain Randomization & Interventions ---
+        # 1. Temperature
+        if options and "temperature" in options:
+            self.temperature = options["temperature"]
+        else:
+            temps = [-10, 0, 10, 20, 30]
+            self.temperature = int(self.np_random.choice(temps))
+        
+        # Map temp to roughness
+        self.roughness = (self.temperature - (-10)) / (30 - (-10))
+        
+        # 2. Traffic Density
+        if options and "traffic_density" in options:
+            self.traffic_density = options["traffic_density"]
+        else:
+            self.traffic_density = self.np_random.choice(["low", "medium", "high"])
+            
+        # Map traffic density to spawn rates
+        if self.traffic_density == "low":
+            self.context["npc_car_spawn_rate"] = 0.005
+            self.context["num_npc_cars"] = 10
+        elif self.traffic_density == "medium":
+            self.context["npc_car_spawn_rate"] = 0.02
+            self.context["num_npc_cars"] = 20
+        else: # high
+            self.context["npc_car_spawn_rate"] = 0.05
+            self.context["num_npc_cars"] = 40
+            
+        # 3. Pedestrian Density
+        if options and "pedestrian_density" in options:
+            self.pedestrian_density = options["pedestrian_density"]
+        else:
+            self.pedestrian_density = self.np_random.choice(["low", "medium", "high"])
+            
+        # Map pedestrian density to spawn rates
+        if self.pedestrian_density == "low":
+            self.context["pedestrian_spawn_rate"] = 0.01
+            self.context["num_pedestrians"] = 5
+        elif self.pedestrian_density == "medium":
+            self.context["pedestrian_spawn_rate"] = 0.03
+            self.context["num_pedestrians"] = 15
+        else: # high
+            self.context["pedestrian_spawn_rate"] = 0.06
+            self.context["num_pedestrians"] = 30
+            
+        # 4. Driver Impatience
+        if options and "driver_impatience" in options:
+            self.driver_impatience = float(options["driver_impatience"])
+        else:
+            self.driver_impatience = float(self.np_random.uniform(0.0, 1.0))
+            
+        # 5. NPC Color
+        if options and "npc_color" in options:
+            self.npc_color = options["npc_color"]
+        else:
+            self.npc_color = "random"
+            
+        # 6. NPC Size
+        if options and "npc_size" in options:
+            self.npc_size = options["npc_size"]
+        else:
+            self.npc_size = "random"
+        
+        # Update context
+        self.context["temperature"] = self.temperature
+        self.context["roughness"] = self.roughness
+        self.context["traffic_density"] = self.traffic_density
+        self.context["pedestrian_density"] = self.pedestrian_density
+        self.context["driver_impatience"] = self.driver_impatience
+        self.context["npc_color"] = self.npc_color
+        self.context["npc_size"] = self.npc_size
+        
+        # Physics modifiers
+        # Friction: REMOVED dependency on temp for agent (kept at default 0.98)
+        
+        # NPC Speed Factor
+        self.npc_speed_factor = 0.6 + (0.4 * self.roughness)
+        
+        # NPC Brake Factor Adjustment
+        self.npc_brake_mod = 0.05 * (1.0 - self.roughness)
+        
         # Initialize view offset
         self.view_offset = self._agent_location - np.array([self.window_size / 2, self.window_size / 2])
         self.view_offset = np.clip(self.view_offset, 0, max(0, self.map_size - self.window_size))
@@ -335,7 +425,17 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         self.traffic_light_timer = 0
         
         observation = self._get_obs()
-        info = {}
+        info = {
+            "causal_vars": {
+                "temperature": self.temperature,
+                "traffic_density": self.traffic_density,
+                "pedestrian_density": self.pedestrian_density,
+                "driver_impatience": self.driver_impatience,
+                "npc_color": self.npc_color,
+                "npc_size": self.npc_size,
+                "roughness": self.roughness
+            }
+        }
         
         if self.render_mode == "human":
             self._render_frame()
@@ -531,29 +631,72 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         spawn_idx = self.np_random.integers(0, len(self.car_spawn_points))
         spawn = self.car_spawn_points[spawn_idx]
         
+        # Determine Size
+        global_size = self.context.get("npc_size", "random")
+        if global_size != "random":
+            if global_size == "small":
+                length, width = 30, 15
+            elif global_size == "medium":
+                length, width = 40, 20
+            else: # large
+                length, width = 50, 25
+        else:
+            length = 30 + self.np_random.random() * 20
+            width = 15 + self.np_random.random() * 10
+            
         # Visual variety: per-car size and color (rainbow shades)
-        car_len = float(18 + self.np_random.random()*20)  # [18..38]
-        car_wid = float(10 + self.np_random.random()*16)  # [10..26]
+        # car_len = float(18 + self.np_random.random()*20)  # [18..38]
         rainbow = [
             (255, 0, 0), (255, 127, 0), (255, 255, 0),
             (0, 200, 0), (0, 120, 255), (75, 0, 130), (148, 0, 211)
         ]
-        base = rainbow[int(self.np_random.integers(0, len(rainbow)))]
-        shade = 0.7 + float(self.np_random.random())*0.3
-        color = (int(base[0]*shade), int(base[1]*shade), int(base[2]*shade))
+        # Determine Color
+        global_color = self.context.get("npc_color", "random")
+        if global_color != "random":
+            color_map = {
+                "red": (200, 50, 50),
+                "blue": (50, 50, 200),
+                "green": (50, 200, 50),
+                "yellow": (200, 200, 50),
+                "white": (240, 240, 240),
+                "black": (50, 50, 50)
+            }
+            color = color_map.get(global_color, (50, 50, 200))
+        else:
+            base = rainbow[int(self.np_random.integers(0, len(rainbow)))]
+            shade = 0.7 + float(self.np_random.random())*0.3
+            color = (int(base[0]*shade), int(base[1]*shade), int(base[2]*shade))
+            
+        # Determine Size
+        global_size = self.context.get("npc_size", "random")
+        if global_size != "random":
+            if global_size == "small":
+                length, width = 30, 15
+            elif global_size == "medium":
+                length, width = 40, 20
+            else: # large
+                length, width = 50, 25
+        else:
+            length = 30 + self.np_random.random() * 20
+            width = 15 + self.np_random.random() * 10
+            
+        # Apply Driver Impatience
+        impatience = self.context.get("driver_impatience", 0.5)
+        impatience_speed_mod = 0.9 + (0.3 * impatience)
+        
         npc_car = {
             "pos": spawn["pos"].copy().astype(np.float32),
             "heading": spawn["heading"],
             "velocity": np.array([0.0, 0.0], dtype=np.float32),
-            "speed": self.npc_car_speed * (0.8 + self.np_random.random() * 0.4),  # Varying speeds
+            "speed": self.npc_car_speed * (0.8 + self.np_random.random() * 0.4) * getattr(self, "npc_speed_factor", 1.0) * impatience_speed_mod,
             "target_speed": 0.0,
             "state": "driving",  # driving, stopped_at_light, slowing_for_yellow, turning
             "road_type": spawn["type"],
             "direction": spawn.get("direction", "east"),  # Store direction for traffic light checking
             "turn_decision": None,  # None, "left", "right", "straight" - decided at intersection
             "has_turned": False,  # Track if car has completed turn at current intersection
-            "length": car_len,
-            "width": car_wid,
+            "length": length,
+            "width": width,
             "color": color
         }
         
@@ -1455,10 +1598,16 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         current_speed = np.linalg.norm(self._agent_velocity)
         if accel_cmd < 0 and current_speed > 0.01:
             # Braking: apply negative acceleration but don't allow reverse
-            accel = self.acceleration * accel_cmd
+            # Scale braking efficiency by roughness (icy = less braking power)
+            # Roughness 0.0 (-10C) -> 40% braking power
+            # Roughness 1.0 (30C) -> 100% braking power
+            braking_efficiency = 0.4 + (0.6 * self.context.get("roughness", 1.0))
+            accel = self.acceleration * accel_cmd * braking_efficiency
+            
             self._agent_velocity[0] += accel * np.cos(self._agent_heading)
             self._agent_velocity[1] += accel * -np.sin(self._agent_heading)
             # Clamp to prevent reverse (velocity should not go negative along heading)
+            speed_after_brake = np.linalg.norm(self._agent_velocity)
             forward_vec = np.array([np.cos(self._agent_heading), -np.sin(self._agent_heading)])
             vel_along_heading = np.dot(self._agent_velocity, forward_vec)
             if vel_along_heading < 0:
@@ -1566,7 +1715,15 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             "num_pedestrians": len(self.pedestrians),
             "num_npc_cars": len(self.npc_cars),
             "collision_with_pedestrian": collision_with_pedestrian,
-            "agent_speed": float(np.linalg.norm(self._agent_velocity))
+            "collision_with_pedestrian": collision_with_pedestrian,
+            "agent_speed": float(np.linalg.norm(self._agent_velocity)),
+            "causal_vars": {
+                "temperature": self.temperature,
+                "traffic_density": self.traffic_density,
+                "pedestrian_density": self.pedestrian_density,
+                "driver_impatience": self.driver_impatience,
+                "roughness": self.roughness
+            }
         }
         
         if self.render_mode == "human":
@@ -1776,6 +1933,161 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         else:  # rgb_array
             return np.transpose(
                 np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
+            )
+
+    def close(self):
+        """Clean up resources."""
+        if self.window is not None:
+            pygame.display.quit()
+            pygame.quit()
+
+    def _render_frame(self):
+        """Render a single frame using pygame."""
+        if self.window is None and self.render_mode == "human":
+            pygame.init()
+            pygame.display.init()
+            self.window = pygame.display.set_mode((self.window_size, self.window_size))
+        if self.clock is None and self.render_mode == "human":
+            self.clock = pygame.time.Clock()
+
+        # Create canvas (full map size)
+        canvas = pygame.Surface((self.map_size, self.map_size))
+        canvas.fill((128, 128, 128))  # Gray background
+        
+        # Draw roads
+        for road in self.horizontal_roads:
+            pygame.draw.rect(canvas, (64, 64, 64), 
+                           pygame.Rect(road["x_start"], road["y"] - self.road_width/2, 
+                                     road["x_end"] - road["x_start"], self.road_width))
+        
+        for road in self.vertical_roads:
+            pygame.draw.rect(canvas, (64, 64, 64), 
+                           pygame.Rect(road["x"] - self.road_width/2, road["y_start"], 
+                                     self.road_width, road["y_end"] - road["y_start"]))
+            
+        # Draw intersections
+        for inter in self.intersections:
+            pos = inter["pos"]
+            pygame.draw.rect(canvas, (80, 80, 80),
+                           pygame.Rect(pos[0]-self.intersection_size/2, pos[1]-self.intersection_size/2,
+                                       self.intersection_size, self.intersection_size))
+            
+            # Draw traffic lights
+            light = self.traffic_lights[inter["grid"]]
+            light_offset = self.intersection_size//2 - 15
+            size = 6
+            
+            # Draw lights for all directions
+            # North
+            color = (0,255,0) if light["directions"]["north"]=="green" else (255,255,0) if light["directions"]["north"]=="yellow" else (255,0,0)
+            pygame.draw.circle(canvas, color, (int(pos[0]), int(pos[1]-light_offset)), size)
+            # South
+            color = (0,255,0) if light["directions"]["south"]=="green" else (255,255,0) if light["directions"]["south"]=="yellow" else (255,0,0)
+            pygame.draw.circle(canvas, color, (int(pos[0]), int(pos[1]+light_offset)), size)
+            # East
+            color = (0,255,0) if light["directions"]["east"]=="green" else (255,255,0) if light["directions"]["east"]=="yellow" else (255,0,0)
+            pygame.draw.circle(canvas, color, (int(pos[0]+light_offset), int(pos[1])), size)
+            # West
+            color = (0,255,0) if light["directions"]["west"]=="green" else (255,255,0) if light["directions"]["west"]=="yellow" else (255,0,0)
+            pygame.draw.circle(canvas, color, (int(pos[0]-light_offset), int(pos[1])), size)
+
+        # Draw zebra crossings
+        stripe_width = 10
+        stripe_spacing = 6
+        for crossing in self.zebra_crossings:
+            if crossing["direction"] == "horizontal":
+                start_x = int(crossing["start"][0])
+                end_x = int(crossing["end"][0])
+                y = int(crossing["start"][1])
+                x = start_x
+                while x < end_x:
+                    pygame.draw.rect(canvas, (255, 255, 255), 
+                                   pygame.Rect(x, y - 4, stripe_width, 8))
+                    x += stripe_width + stripe_spacing
+            else:
+                start_y = int(crossing["start"][1])
+                end_y = int(crossing["end"][1])
+                x = int(crossing["start"][0])
+                y = start_y
+                while y < end_y:
+                    pygame.draw.rect(canvas, (255, 255, 255), 
+                                   pygame.Rect(x - 4, y, 8, stripe_width))
+                    y += stripe_width + stripe_spacing
+
+        # Draw NPC cars
+        for car in self.npc_cars:
+            car_pos = car["pos"].astype(int)
+            cos_h = np.cos(car["heading"])
+            sin_h = np.sin(car["heading"])
+            length = car.get("length", self.car_length)
+            width = car.get("width", self.car_width)
+            corners = np.array([[-length / 2, -width / 2],
+                                [ length / 2, -width / 2],
+                                [ length / 2,  width / 2],
+                                [-length / 2,  width / 2]])
+            rotation_matrix = np.array([[cos_h, sin_h],[-sin_h, cos_h]])
+            rotated_corners = (rotation_matrix @ corners.T).T + car_pos
+            color = car.get("color", (0, 100, 255))
+            pygame.draw.polygon(canvas, color, rotated_corners)
+
+        # Draw pedestrians
+        for ped in self.pedestrians:
+            ped_pos = ped["pos"].astype(int)
+            color = (255, 100, 100) if ped.get("is_jaywalking", False) else (100, 100, 255)
+            pygame.draw.circle(canvas, color, ped_pos, self.pedestrian_radius)
+            # Direction indicator
+            if "target" in ped:
+                direction = ped["target"] - ped["pos"]
+                if np.linalg.norm(direction) > 0:
+                    direction_normalized = direction / np.linalg.norm(direction)
+                    front_pos = ped_pos + (direction_normalized * self.pedestrian_radius * 1.5).astype(int)
+                    pygame.draw.circle(canvas, (255, 255, 255), front_pos, 2)
+
+        # Draw Agent
+        agent_pos = self._agent_location.astype(int)
+        cos_h = np.cos(self._agent_heading)
+        sin_h = np.sin(self._agent_heading)
+        corners = np.array([
+            [-self.car_length / 2, -self.car_width / 2],
+            [self.car_length / 2, -self.car_width / 2],
+            [self.car_length / 2, self.car_width / 2],
+            [-self.car_length / 2, self.car_width / 2]
+        ])
+        rotation_matrix = np.array([[cos_h, sin_h], [-sin_h, cos_h]])
+        rotated_corners = (rotation_matrix @ corners.T).T + agent_pos
+        pygame.draw.polygon(canvas, (255, 0, 0), rotated_corners)
+        front_offset = np.array([self.car_length / 2 * cos_h, -self.car_length / 2 * sin_h])
+        front_pos = agent_pos + front_offset
+        pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
+
+        # Crop to view window (camera follows agent)
+        # Update view offset to keep agent centered
+        target_offset = self._agent_location - np.array([self.window_size / 2, self.window_size / 2])
+        # Smooth camera movement
+        self.view_offset += (target_offset - self.view_offset) * 0.1
+        # Clamp to map bounds
+        self.view_offset = np.clip(self.view_offset, 0, max(0, self.map_size - self.window_size))
+        
+        view_rect = pygame.Rect(int(self.view_offset[0]), int(self.view_offset[1]), 
+                              self.window_size, self.window_size)
+        view_surface = canvas.subsurface(view_rect)
+        
+        # Draw HUD on the view surface (Temp/Roughness)
+        if pygame.font:
+            font = pygame.font.Font(None, 36)
+            temp_text = font.render(f"Temp: {self.context.get('temperature', 20)} C", True, (255, 255, 255))
+            rough_text = font.render(f"Roughness: {self.context.get('roughness', 0.0):.2f}", True, (255, 255, 255))
+            view_surface.blit(temp_text, (10, 10))
+            view_surface.blit(rough_text, (10, 50))
+
+        if self.render_mode == "human":
+            self.window.blit(view_surface, (0, 0))
+            pygame.event.pump()
+            pygame.display.update()
+            self.clock.tick(self.metadata["render_fps"])
+        else:  # rgb_array
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(view_surface)), axes=(1, 0, 2)
             )
 
     def close(self):

@@ -40,7 +40,7 @@ def demo_extended_environment():
     print("=" * 70)
     
     # Reset with default settings
-    obs, info = env.reset(seed=42)
+    obs, info = env.reset()
     
     print(f"\nEnvironment reset!")
     print(f"  Car position: ({obs[0]:.0f}, {obs[1]:.0f})")

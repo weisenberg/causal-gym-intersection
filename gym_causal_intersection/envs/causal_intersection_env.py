@@ -34,7 +34,14 @@ class UrbanCausalIntersectionEnv(gym.Env):
             "traffic_light_duration": 30,
             "pedestrian_spawn_rate": 0.05,  # Probability of spawning a pedestrian per step (increased)
             "num_pedestrians": 8,  # Maximum number of pedestrians (increased)
-            "jaywalk_probability": 0.15  # Probability that a pedestrian will jaywalk (reduced - more use crossings)
+            "jaywalk_probability": 0.15,  # Probability that a pedestrian will jaywalk (reduced - more use crossings)
+            "temperature": 20,  # Default temperature
+            "roughness": 0.0,   # Default roughness
+            "traffic_density": "medium", # low, medium, high
+            "pedestrian_density": "medium", # low, medium, high
+            "driver_impatience": 0.5, # 0.0 to 1.0
+            "npc_color": "random", # random, red, blue, green, yellow, white, black
+            "npc_size": "random", # random, small, medium, large
         }
         
         # --- Define Spaces ---
@@ -159,13 +166,109 @@ class UrbanCausalIntersectionEnv(gym.Env):
         self._agent_velocity = np.array([0.0, 0.0], dtype=np.float32)
         self._agent_heading = car_spawn["heading"]
         
+        # --- Causal RL: Domain Randomization & Interventions ---
+        # 1. Temperature (Intervention check)
+        if options and "temperature" in options:
+            self.temperature = options["temperature"]
+        else:
+            temps = [-10, 0, 10, 20, 30]
+            self.temperature = int(self.np_random.choice(temps))
+            
+        # Map temp to roughness
+        self.roughness = (self.temperature - (-10)) / (30 - (-10))
+        
+        # 2. Traffic Density (Intervention check)
+        if options and "traffic_density" in options:
+            self.traffic_density = options["traffic_density"]
+        else:
+            self.traffic_density = self.np_random.choice(["low", "medium", "high"])
+            
+        # Map traffic density to spawn rates
+        if self.traffic_density == "low":
+            self.context["npc_car_spawn_rate"] = 0.01
+            self.context["num_npc_cars"] = 3
+        elif self.traffic_density == "medium":
+            self.context["npc_car_spawn_rate"] = 0.05
+            self.context["num_npc_cars"] = 8
+        else: # high
+            self.context["npc_car_spawn_rate"] = 0.1
+            self.context["num_npc_cars"] = 15
+            
+        # 3. Pedestrian Density (Intervention check)
+        if options and "pedestrian_density" in options:
+            self.pedestrian_density = options["pedestrian_density"]
+        else:
+            self.pedestrian_density = self.np_random.choice(["low", "medium", "high"])
+            
+        # Map pedestrian density to spawn rates
+        if self.pedestrian_density == "low":
+            self.context["pedestrian_spawn_rate"] = 0.01
+            self.context["num_pedestrians"] = 3
+        elif self.pedestrian_density == "medium":
+            self.context["pedestrian_spawn_rate"] = 0.05
+            self.context["num_pedestrians"] = 8
+        else: # high
+            self.context["pedestrian_spawn_rate"] = 0.1
+            self.context["num_pedestrians"] = 15
+            
+        # 4. Driver Impatience (Intervention check)
+        if options and "driver_impatience" in options:
+            self.driver_impatience = float(options["driver_impatience"])
+        else:
+            self.driver_impatience = float(self.np_random.uniform(0.0, 1.0))
+            
+        # 5. NPC Color (Visual Confounder)
+        if options and "npc_color" in options:
+            self.npc_color = options["npc_color"]
+        else:
+            # Default to random per car (represented as "random" state)
+            # Or we could randomize the GLOBAL color for this episode (e.g. all cars are blue)
+            # For Causal RL, usually we want to control the distribution.
+            # Let's keep "random" as the default state where each car is different.
+            self.npc_color = "random"
+            
+        # 6. NPC Size (Visual Confounder)
+        if options and "npc_size" in options:
+            self.npc_size = options["npc_size"]
+        else:
+            self.npc_size = "random"
+        
+        # Update context with all causal vars
+        self.context["temperature"] = self.temperature
+        self.context["roughness"] = self.roughness
+        self.context["traffic_density"] = self.traffic_density
+        self.context["pedestrian_density"] = self.pedestrian_density
+        self.context["driver_impatience"] = self.driver_impatience
+        self.context["npc_color"] = self.npc_color
+        self.context["npc_size"] = self.npc_size
+        
+        # Physics modifiers based on roughness
+        # Friction: REMOVED dependency on temp for agent (kept at default 1.0)
+        # Agent should be able to accelerate to max speed independent of temp
+        
+        # NPC Speed Factor: 0.6 (icy/cautious) to 1.0 (normal)
+        self.npc_speed_factor = 0.6 + (0.4 * self.roughness)
+        
+        # NPC Brake Factor Adjustment:
+        self.npc_brake_mod = 0.05 * (1.0 - self.roughness)
+        
         # Reset pedestrians
         self.pedestrians = []
         # Reset time and NPCs
         self.step_count = 0
 
         observation = self._get_obs()
-        info = {}
+        info = {
+            "causal_vars": {
+                "temperature": self.temperature,
+                "traffic_density": self.traffic_density,
+                "pedestrian_density": self.pedestrian_density,
+                "driver_impatience": self.driver_impatience,
+                "npc_color": self.npc_color,
+                "npc_size": self.npc_size,
+                "roughness": self.roughness
+            }
+        }
 
         if self.render_mode == "human":
             self._render_frame()
@@ -493,14 +596,50 @@ class UrbanCausalIntersectionEnv(gym.Env):
         spawn_idx = int(self.np_random.integers(0, len(self.car_spawn_points)))
         spawn = self.car_spawn_points[spawn_idx]
         # Per-car variability
-        cruise_speed = float(self.npc_car_speed * (0.7 + self.np_random.random()*0.8))  # ~[2.45..6.3]
-        max_speed = cruise_speed * (1.1 + self.np_random.random()*0.3)  # slightly higher than cruise
-        accel = float(0.18 + self.np_random.random()*0.22)  # [0.18..0.40]
-        brake_factor = float(0.82 + self.np_random.random()*0.12)  # [0.82..0.94]
-        stopping_distance = float(30 + self.np_random.random()*40)  # [30..70]
-        # Car sizes (allow wider bodies)
-        car_len = float(18 + self.np_random.random()*20)  # [18..38]
-        car_wid = float(10 + self.np_random.random()*16)  # [10..26]
+        # Apply Temperature Physics
+        speed_factor = getattr(self, "npc_speed_factor", 1.0)
+        brake_mod = getattr(self, "npc_brake_mod", 0.0)
+        
+        # Apply Driver Impatience
+        # Impatience (0.0 to 1.0) increases acceleration and max speed, decreases stopping distance buffer
+        impatience = self.context.get("driver_impatience", 0.5)
+        
+        # Base cruise speed modified by impatience (more impatient = faster)
+        # Impatience 0.0 -> 0.9x speed, Impatience 1.0 -> 1.2x speed
+        impatience_speed_mod = 0.9 + (0.3 * impatience)
+        
+        cruise_speed = float(self.npc_car_speed * (0.7 + self.np_random.random()*0.8)) * speed_factor * impatience_speed_mod
+        max_speed = cruise_speed * (1.1 + self.np_random.random()*0.3)
+        
+        # Accel modified by impatience (more impatient = harder accel)
+        # Impatience 0.0 -> 0.8x accel, Impatience 1.0 -> 1.5x accel
+        impatience_accel_mod = 0.8 + (0.7 * impatience)
+        accel = float(0.18 + self.np_random.random()*0.22) * speed_factor * impatience_accel_mod
+        
+        base_brake = float(0.82 + self.np_random.random()*0.12)
+        brake_factor = min(0.99, base_brake + brake_mod) # Higher factor = weaker braking
+        
+        stopping_distance = float(30 + self.np_random.random()*40)
+        # Impatience reduces stopping distance (tailgating)
+        # Impatience 1.0 -> 0.8x stopping distance
+        stopping_distance *= (1.0 - (0.2 * impatience))
+        
+        # Increase stopping distance on ice (visual behavior logic)
+        if self.roughness < 0.5:
+            stopping_distance *= 1.5
+        # Determine Size (Length/Width)
+        global_size = self.context.get("npc_size", "random")
+        if global_size != "random":
+            if global_size == "small":
+                car_len, car_wid = 30, 15
+            elif global_size == "medium":
+                car_len, car_wid = 40, 20
+            else: # large
+                car_len, car_wid = 50, 25
+        else:
+            # Random size per car
+            car_len = float(18 + self.np_random.random()*20)  # [18..38]
+            car_wid = float(10 + self.np_random.random()*16)  # [10..26]
         # Colors: random rainbow base with shading
         rainbow = [
             (255, 0, 0),      # red
@@ -515,6 +654,41 @@ class UrbanCausalIntersectionEnv(gym.Env):
         # Apply shade variation (multiply by factor 0.7..1.0)
         shade = 0.7 + float(self.np_random.random())*0.3
         color = (int(base[0]*shade), int(base[1]*shade), int(base[2]*shade))
+        # Determine Color
+        global_color = self.context.get("npc_color", "random")
+        if global_color != "random":
+            # Use the forced global color
+            color_map = {
+                "red": (200, 50, 50),
+                "blue": (50, 50, 200),
+                "green": (50, 200, 50),
+                "yellow": (200, 200, 50),
+                "white": (240, 240, 240),
+                "black": (50, 50, 50)
+            }
+            color = color_map.get(global_color, (50, 50, 200)) # Default to blue if unknown
+        else:
+            # Random color per car
+            color = (
+                self.np_random.integers(50, 255),
+                self.np_random.integers(50, 255),
+                self.np_random.integers(50, 255),
+            )
+            
+        # Determine Size (Length/Width)
+        global_size = self.context.get("npc_size", "random")
+        if global_size != "random":
+            if global_size == "small":
+                length, width = 30, 15
+            elif global_size == "medium":
+                length, width = 40, 20
+            else: # large
+                length, width = 50, 25
+        else:
+            # Random size per car
+            length = 30 + self.np_random.random() * 20
+            width = 15 + self.np_random.random() * 10
+
         car = {
             "pos": spawn["pos"].copy().astype(np.float32),
             "heading": spawn["heading"],
@@ -528,8 +702,8 @@ class UrbanCausalIntersectionEnv(gym.Env):
             "type": spawn["type"],
             "direction": spawn["direction"],
             "state": "driving",
-            "length": car_len,
-            "width": car_wid,
+            "length": length,
+            "width": width,
             "color": color
         }
         self.npc_cars.append(car)
@@ -780,7 +954,12 @@ class UrbanCausalIntersectionEnv(gym.Env):
         current_speed = np.linalg.norm(self._agent_velocity)
         if accel_cmd < 0 and current_speed > 0.01:
             # Braking: apply negative acceleration but don't allow reverse
-            accel = self.acceleration * accel_cmd
+            # Scale braking efficiency by roughness (icy = less braking power)
+            # Roughness 0.0 (-10C) -> 40% braking power
+            # Roughness 1.0 (30C) -> 100% braking power
+            braking_efficiency = 0.4 + (0.6 * self.context.get("roughness", 1.0))
+            accel = self.acceleration * accel_cmd * braking_efficiency
+            
             self._agent_velocity[0] += accel * np.cos(self._agent_heading)
             self._agent_velocity[1] += accel * -np.sin(self._agent_heading)
             # Clamp to prevent reverse (velocity should not go negative along heading)
@@ -826,7 +1005,7 @@ class UrbanCausalIntersectionEnv(gym.Env):
         self._update_traffic_lights()
         
         # Spawn new NPC cars (low rate)
-        if self.np_random.random() < 0.05:
+        if self.np_random.random() < self.context.get("npc_car_spawn_rate", 0.05):
             self._spawn_npc_car()
         # Update NPC cars
         self._update_npc_cars()
@@ -874,7 +1053,14 @@ class UrbanCausalIntersectionEnv(gym.Env):
             "num_pedestrians": len(self.pedestrians),
             "collision": collision,
             "num_npc_cars": len(self.npc_cars),
-            "success": False
+            "success": False,
+            "causal_vars": {
+                "temperature": self.temperature,
+                "traffic_density": self.traffic_density,
+                "pedestrian_density": self.pedestrian_density,
+                "driver_impatience": self.driver_impatience,
+                "roughness": self.roughness
+            }
         }
         if collision:
             terminated = True
@@ -1071,6 +1257,14 @@ class UrbanCausalIntersectionEnv(gym.Env):
         front_offset = np.array([self.car_length / 2 * cos_h, -self.car_length / 2 * sin_h])
         front_pos = agent_pos + front_offset
         pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
+
+        # Render Temperature and Roughness Info
+        if pygame.font:
+            font = pygame.font.Font(None, 36)
+            temp_text = font.render(f"Temp: {self.context.get('temperature', 20)} C", True, (255, 255, 255))
+            rough_text = font.render(f"Roughness: {self.context.get('roughness', 0.0):.2f}", True, (255, 255, 255))
+            canvas.blit(temp_text, (10, 10))
+            canvas.blit(rough_text, (10, 50))
 
         if self.render_mode == "human":
             self.window.blit(canvas, canvas.get_rect())

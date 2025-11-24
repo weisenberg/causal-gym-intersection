@@ -57,6 +57,65 @@ NPC cars follow right-side driving rules based on their direction:
 
 This prevents head-on collisions and ensures realistic traffic flow.
 
+## Temperature-Dependent Physics
+
+The environment simulates weather conditions through a **Temperature** system that affects road physics:
+
+- **Temperature Range**: `-10°C` to `30°C`
+- **Roughness**: Derived from temperature (0.0 at -10°C to 1.0 at 30°C)
+
+### Effects
+1. **Friction**:
+   - **Low Temp (-10°C)**: Icy/Slippery. Lower friction coefficient.
+   - **High Temp (30°C)**: Dry/Grippy. Higher friction coefficient.
+   - *Note*: The Agent car has been decoupled from this friction limit to allow for trial-and-error learning (it can accelerate fully but will slide/fail to stop on ice).
+
+2. **Braking Distance**:
+   - **Icy**: Braking efficiency is reduced (40% power), resulting in significantly longer stopping distances.
+   - **Dry**: Normal braking efficiency (100% power).
+
+3. **NPC Behavior**:
+   - NPC cars automatically drive slower and start braking earlier on icy roads to maintain safety.
+
+## Causal RL Features
+
+This environment is specifically designed for **Causal Reinforcement Learning** (CRL) research. It supports **Domain Randomization** and **Interventions** on key causal variables (confounders).
+
+### Causal Variables
+
+| Variable | Type | Values / Range | Effect |
+| :--- | :--- | :--- | :--- |
+| **`temperature`** | Discrete | `[-10, 0, 10, 20, 30]` | Friction, Braking, NPC Speed |
+| **`traffic_density`** | Discrete | `['low', 'medium', 'high']` | Number of NPC cars |
+| **`pedestrian_density`** | Discrete | `['low', 'medium', 'high']` | Number of pedestrians |
+| **`driver_impatience`** | Continuous | `0.0` to `1.0` | NPC Acceleration, Speed, Aggressiveness |
+| **`npc_color`** | Categorical | `random`, `red`, `blue`, ... | Visual appearance of ALL cars (Spurious correlation) |
+| **`npc_size`** | Categorical | `random`, `small`, `medium`, `large` | Physical size of ALL cars |
+
+### Usage
+
+#### 1. Observational Data (Randomized)
+By default, `reset()` randomizes all causal variables to generate diverse observational data.
+```python
+obs, info = env.reset()
+print(info["causal_vars"]) 
+# {'temperature': -10, 'traffic_density': 'high', ...}
+```
+
+#### 2. Interventions (Do-Calculus)
+You can perform interventions by forcing specific values using the `options` dictionary. This allows for counterfactual reasoning and bias testing.
+```python
+# Intervention: Force Icy Roads and Red Cars
+options = {
+    "temperature": -10,
+    "npc_color": "red"
+}
+obs, info = env.reset(options=options)
+```
+
+#### 3. Data Extraction
+The `info` dictionary returned by `reset()` and `step()` contains the ground truth causal state under the key `causal_vars`.
+
 ## Action Space
 
 The action space is **continuous** with 2 dimensions:

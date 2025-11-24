@@ -34,7 +34,7 @@ def demo_environment():
     print("=" * 60)
     
     # Reset with default settings (good balance of pedestrians)
-    obs, info = env.reset(seed=42)
+    obs, info = env.reset()
     
     print(f"\nEnvironment reset!")
     print(f"  Car position: ({obs[0]:.0f}, {obs[1]:.0f})")
