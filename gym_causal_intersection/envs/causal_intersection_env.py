@@ -15,7 +15,7 @@ class UrbanCausalIntersectionEnv(gym.Env):
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None, observation_type: str = "kinematic"):
+    def __init__(self, render_mode=None, observation_type: str = "kinematic", max_npcs: int = None, max_pedestrians: int = None):
         super().__init__()
         
         # Window setup
@@ -33,7 +33,7 @@ class UrbanCausalIntersectionEnv(gym.Env):
             "friction": 1.0,
             "traffic_light_duration": 30,
             "pedestrian_spawn_rate": 0.05,  # Probability of spawning a pedestrian per step (increased)
-            "num_pedestrians": 8,  # Maximum number of pedestrians (increased)
+            "num_pedestrians": 8 if max_pedestrians is None else max_pedestrians,  # Maximum number of pedestrians
             "jaywalk_probability": 0.15,  # Probability that a pedestrian will jaywalk (reduced - more use crossings)
             "temperature": 20,  # Default temperature
             "roughness": 0.0,   # Default roughness
@@ -99,10 +99,20 @@ class UrbanCausalIntersectionEnv(gym.Env):
         self.npc_cars = []
         self.npc_car_speed = 3.5  # legacy default; per-car overrides are created at spawn
         self.car_spawn_points = self._build_car_spawns()
+        self.max_npcs = 6 if max_npcs is None else max_npcs # Default to 6 if not specified
         
         # Time tracking for success criterion (59 seconds)
         self.step_count = 0
         self.success_after_steps = int(59 * self.metadata["render_fps"])
+        
+        # Intersection crossing tracking for exploration rewards
+        self.intersections_crossed = set()  # Track which intersections have been crossed
+        self.was_in_intersection = False  # Track if agent was in intersection last step
+        self.minimum_steps_for_exit = int(30 * self.metadata["render_fps"])  # 30 seconds minimum
+        
+        # Episode tracking for display
+        self.episode_count = 0
+        self.episode_reward = 0.0
         
         # Car spawn points on the right side of roads, facing towards intersection
         # Road center is at 300, road spans 250-350 (100px wide)
@@ -111,7 +121,7 @@ class UrbanCausalIntersectionEnv(gym.Env):
             # South road (bottom), going north towards intersection, right side
             {"pos": np.array([320.0, 550.0]), "heading": np.pi / 2},  # π/2 = up (north)
             # North road (top), going south towards intersection, right side  
-            {"pos": np.array([320.0, 50.0]), "heading": -np.pi / 2},  # -π/2 = down (south)
+            {"pos": np.array([280.0, 50.0]), "heading": -np.pi / 2},  # -π/2 = down (south)
             # East road (right), going west towards intersection, right side
             {"pos": np.array([550.0, 270.0]), "heading": np.pi},  # π = left (west)
             # West road (left), going east towards intersection, right side
@@ -221,17 +231,18 @@ class UrbanCausalIntersectionEnv(gym.Env):
         if options and "npc_color" in options:
             self.npc_color = options["npc_color"]
         else:
-            # Default to random per car (represented as "random" state)
-            # Or we could randomize the GLOBAL color for this episode (e.g. all cars are blue)
-            # For Causal RL, usually we want to control the distribution.
-            # Let's keep "random" as the default state where each car is different.
-            self.npc_color = "random"
+            # Randomly choose a mode: mixed ("random") or one of the specific colors
+            # This ensures episodes vary between "Rainbow Traffic" and "Uniform Color Traffic"
+            colors = ["random", "red", "blue", "green", "yellow", "white", "black"]
+            self.npc_color = self.np_random.choice(colors)
             
         # 6. NPC Size (Visual Confounder)
         if options and "npc_size" in options:
             self.npc_size = options["npc_size"]
         else:
-            self.npc_size = "random"
+            # Randomly choose a mode
+            sizes = ["random", "small", "medium", "large"]
+            self.npc_size = self.np_random.choice(sizes)
         
         # Update context with all causal vars
         self.context["temperature"] = self.temperature
@@ -254,8 +265,26 @@ class UrbanCausalIntersectionEnv(gym.Env):
         
         # Reset pedestrians
         self.pedestrians = []
-        # Reset time and NPCs
+        # Reset NPC cars
+        self.npc_cars = []
+        
+        # Spawn initial NPCs and Pedestrians to match "random reset"
+        # Spawn NPCs
+        for _ in range(self.context.get("num_npc_cars", 5)):
+             self._spawn_npc_car()
+             
+        # Spawn Pedestrians
+        for _ in range(self.context.get("num_pedestrians", 5)):
+             self._spawn_pedestrian()
+             
+        # Reset time and intersection tracking
         self.step_count = 0
+        self.intersections_crossed = set()
+        self.was_in_intersection = False
+        
+        # Reset episode tracking
+        self.episode_count += 1
+        self.episode_reward = 0.0
 
         observation = self._get_obs()
         info = {
@@ -401,6 +430,45 @@ class UrbanCausalIntersectionEnv(gym.Env):
             if distance < (self.car_width / 2 + self.pedestrian_radius):
                 return True
         return False
+    
+    def _check_obb_collision(self, pos1, heading1, length1, width1, pos2, heading2, length2, width2):
+        """Check collision between two oriented bounding boxes using Separating Axis Theorem."""
+        # Get corners of both rectangles
+        def get_corners(pos, heading, length, width):
+            cos_h = np.cos(heading)
+            sin_h = np.sin(heading)
+            half_l = length / 2.0
+            half_w = width / 2.0
+            corners = np.array([
+                [-half_l, -half_w],
+                [half_l, -half_w],
+                [half_l, half_w],
+                [-half_l, half_w]
+            ])
+            rotation = np.array([[cos_h, sin_h], [-sin_h, cos_h]])
+            return (rotation @ corners.T).T + pos
+        
+        corners1 = get_corners(pos1, heading1, length1, width1)
+        corners2 = get_corners(pos2, heading2, length2, width2)
+        
+        # Test axes from both rectangles
+        axes = [
+            np.array([np.cos(heading1), -np.sin(heading1)]),  # Box 1 forward
+            np.array([-np.sin(heading1), -np.cos(heading1)]), # Box 1 side
+            np.array([np.cos(heading2), -np.sin(heading2)]),  # Box 2 forward
+            np.array([-np.sin(heading2), -np.cos(heading2)])  # Box 2 side
+        ]
+        
+        for axis in axes:
+            # Project all corners onto axis
+            proj1 = np.dot(corners1, axis)
+            proj2 = np.dot(corners2, axis)
+            
+            # Check for separation
+            if np.max(proj1) < np.min(proj2) or np.max(proj2) < np.min(proj1):
+                return False  # Separating axis found, no collision
+        
+        return True  # No separating axis found, collision detected
 
     def _get_obs(self):
         """Get observation either kinematic (55) or pixel (84x84x3)."""
@@ -704,7 +772,11 @@ class UrbanCausalIntersectionEnv(gym.Env):
             "state": "driving",
             "length": length,
             "width": width,
-            "color": color
+            "width": width,
+            "color": color,
+            "width": width,
+            "color": color,
+
         }
         self.npc_cars.append(car)
 
@@ -790,6 +862,8 @@ class UrbanCausalIntersectionEnv(gym.Env):
                         car["target_speed"] = min(car["target_speed"], car["cruise_speed"] * 0.2)
                     elif dist_to_ped < car.get("stopping_distance", 40.0):
                         car["target_speed"] = min(car["target_speed"], car["cruise_speed"] * 0.5)
+
+
             # Check other NPC cars (only if in front)
             for j, other in enumerate(self.npc_cars):
                 if j == i:
@@ -798,9 +872,11 @@ class UrbanCausalIntersectionEnv(gym.Env):
                 dist_to_car = float(np.linalg.norm(vec_to_car))
                 if dist_to_car <= 1e-3:
                     continue
+                
                 dir_to_car = vec_to_car / dist_to_car
                 cos_angle = float(np.dot(forward_vec, dir_to_car))
                 dist_along = float(np.dot(vec_to_car, forward_vec))
+                
                 # Only react to cars in FRONT (not sides or back)
                 if cos_angle > 0.5 and dist_along > 10:  # Ahead and within 60° cone
                     obstacle_in_front = True
@@ -846,100 +922,6 @@ class UrbanCausalIntersectionEnv(gym.Env):
                 cars_to_remove.append(i)
         for i in sorted(cars_to_remove, reverse=True):
             self.npc_cars.pop(i)
-        # Final collision resolver: only front/back for cars, front-only for pedestrians
-        # NPC-to-NPC: only if aligned front/back
-        for i in range(len(self.npc_cars)):
-            for j in range(i + 1, len(self.npc_cars)):
-                a = self.npc_cars[i]
-                b = self.npc_cars[j]
-                vec_ab = b["pos"] - a["pos"]
-                d = np.linalg.norm(vec_ab)
-                if d < 1e-6:
-                    continue
-                forward_a = np.array([np.cos(a["heading"]), -np.sin(a["heading"])])
-                cos_angle = float(np.dot(forward_a, vec_ab / d))
-                dist_along = float(np.dot(vec_ab, forward_a))
-                # Only resolve if aligned front/back (not sides)
-                if abs(cos_angle) > 0.5 and abs(dist_along) > 10:
-                    la = float(a.get("length", self.car_length))
-                    wa = float(a.get("width", self.car_width))
-                    lb = float(b.get("length", self.car_length))
-                    wb = float(b.get("width", self.car_width))
-                    ra = max(la, wa) / 2.0
-                    rb = max(lb, wb) / 2.0
-                    min_sep = ra + rb + 4.0
-                    if d < min_sep:
-                        dir_vec = vec_ab / d
-                        move = (min_sep - d) + 0.5
-                        # Check if cars are stopped - don't push stopped cars
-                        speed_a = np.linalg.norm(a["velocity"])
-                        speed_b = np.linalg.norm(b["velocity"])
-                        is_a_stopped = speed_a < 0.1 and a.get("target_speed", 0) < 0.1
-                        is_b_stopped = speed_b < 0.1 and b.get("target_speed", 0) < 0.1
-                        
-                        if is_a_stopped and not is_b_stopped:
-                            # Only move b (a is stopped, don't push it)
-                            b["pos"] += dir_vec * move
-                            b["target_speed"] = 0.0
-                            b["velocity"] *= b.get("brake_factor", 0.9)
-                        elif is_b_stopped and not is_a_stopped:
-                            # Only move a (b is stopped, don't push it)
-                            a["pos"] -= dir_vec * move
-                            a["target_speed"] = 0.0
-                            a["velocity"] *= a.get("brake_factor", 0.9)
-                        elif not is_a_stopped and not is_b_stopped:
-                            # Both moving - move both apart
-                            a["pos"] -= dir_vec * (move / 2.0)
-                            b["pos"] += dir_vec * (move / 2.0)
-                            a["target_speed"] = 0.0
-                            b["target_speed"] = 0.0
-                            a["velocity"] *= a.get("brake_factor", 0.9)
-                            b["velocity"] *= b.get("brake_factor", 0.9)
-                        # If both stopped, don't move either (they stay stationary)
-        # NPC-to-Agent: only if aligned front/back
-        for car in self.npc_cars:
-            vec_to_agent = self._agent_location - car["pos"]
-            d = np.linalg.norm(vec_to_agent)
-            if d < 1e-6:
-                continue
-            forward_car = np.array([np.cos(car["heading"]), -np.sin(car["heading"])])
-            cos_angle = float(np.dot(forward_car, vec_to_agent / d))
-            dist_along = float(np.dot(vec_to_agent, forward_car))
-            # Only resolve if aligned front/back (not sides)
-            if abs(cos_angle) > 0.5 and abs(dist_along) > 10:
-                l = float(car.get("length", self.car_length))
-                w = float(car.get("width", self.car_width))
-                ra = max(l, w) / 2.0
-                r_agent = max(self.car_length, self.car_width) / 2.0
-                min_sep = ra + r_agent + 4.0
-                if d < min_sep:
-                    dir_vec = vec_to_agent / d
-                    move = (min_sep - d) + 0.5
-                    car["pos"] -= dir_vec * move
-                    car["target_speed"] = 0.0
-                    car["velocity"] *= car.get("brake_factor", 0.85)
-        # NPC-to-pedestrian: only if pedestrian is in front
-        for car in self.npc_cars:
-            forward_car = np.array([np.cos(car["heading"]), -np.sin(car["heading"])])
-            for ped in self.pedestrians:
-                vec_to_ped = ped["pos"] - car["pos"]
-                d = np.linalg.norm(vec_to_ped)
-                if d < 1e-6:
-                    continue
-                cos_angle = float(np.dot(forward_car, vec_to_ped / d))
-                dist_along = float(np.dot(vec_to_ped, forward_car))
-                # Only resolve if pedestrian is in FRONT (not side or back)
-                if cos_angle > 0.5 and dist_along > 10:
-                    l = float(car.get("length", self.car_length))
-                    w = float(car.get("width", self.car_width))
-                    ra = max(l, w) / 2.0
-                    min_sep = ra + self.pedestrian_radius + 4.0
-                    if d < min_sep:
-                        dir_vec = vec_to_ped / d
-                        move = (min_sep - d) + 0.5
-                        car["pos"] -= dir_vec * move
-                        car["target_speed"] = 0.0
-                        car["velocity"] *= car.get("brake_factor", 0.9)
 
     def step(self, action):
         """Execute one step in the environment."""
@@ -974,8 +956,11 @@ class UrbanCausalIntersectionEnv(gym.Env):
             accel = self.acceleration * accel_cmd
             self._agent_velocity[0] += accel * np.cos(self._agent_heading)
             self._agent_velocity[1] += accel * -np.sin(self._agent_heading)
-        # Steering
-        self._agent_heading += self.angular_velocity * steer_cmd
+        # Steering (realistic: can only turn while moving)
+        speed = np.linalg.norm(self._agent_velocity)
+        # Scale turning by speed: no turn at speed=0, reduced turn at low speed, full turn at speed>=0.5
+        turning_factor = min(1.0, speed / 0.5) if speed > 0.01 else 0.0
+        self._agent_heading += self.angular_velocity * steer_cmd * turning_factor
         # No slide
         speed = np.linalg.norm(self._agent_velocity)
         if speed > 0.01:
@@ -1004,9 +989,10 @@ class UrbanCausalIntersectionEnv(gym.Env):
         # Update traffic lights
         self._update_traffic_lights()
         
-        # Spawn new NPC cars (low rate)
-        if self.np_random.random() < self.context.get("npc_car_spawn_rate", 0.05):
-            self._spawn_npc_car()
+        # Spawn new cars if needed
+        if len(self.npc_cars) < self.max_npcs:
+            if np.random.rand() < 0.05:  # 5% chance to spawn a car per step if under limit
+                self._spawn_npc_car()
         # Update NPC cars
         self._update_npc_cars()
         
@@ -1022,13 +1008,39 @@ class UrbanCausalIntersectionEnv(gym.Env):
         reward = 0.0
         
         # Check boundaries
+        # Check boundaries
         off_screen = (
             self._agent_location[0] < 0 or self._agent_location[0] > 600 or
             self._agent_location[1] < 0 or self._agent_location[1] > 600
         )
         
+        # Check if exit was valid (on road)
+        valid_exit = False
+        if off_screen:
+            y = self._agent_location[1]
+            x = self._agent_location[0]
+            # Horizontal road exit (y in [250, 350])
+            if (x < 0 or x > 600) and (250 <= y <= 350):
+                valid_exit = True
+            # Vertical road exit (x in [250, 350])
+            elif (y < 0 or y > 600) and (250 <= x <= 350):
+                valid_exit = True
+        
         # Check for pedestrian collision
         collision = self._check_pedestrian_collision()
+        
+        # Check for NPC car collision (using oriented bounding box collision)
+        npc_collision = False
+        for car in self.npc_cars:
+            if self._check_obb_collision(
+                self._agent_location, self._agent_heading, self.car_length, self.car_width,
+                car["pos"], car["heading"], car.get("length", self.car_length), car.get("width", self.car_width)
+            ):
+                npc_collision = True
+                break
+        
+        # Combine collision flags
+        collision = collision or npc_collision
         
         # Shaped rewards
         # + survival
@@ -1036,17 +1048,47 @@ class UrbanCausalIntersectionEnv(gym.Env):
         # + progress/efficiency
         agent_speed = float(np.linalg.norm(self._agent_velocity))
         reward += 1.0 * (agent_speed / max(1e-6, self.max_speed))
-        # - running a red light
+        
+        # - stationary penalty (encourages exploration)
+        if agent_speed < 0.1:
+            reward -= 0.5  # Penalty for not moving
+        
+        # + intersection crossing bonus (encourages exploration)
+        current_in_intersection = False
+        for inter in self.intersections:
+            inter_pos = inter["pos"]
+            edge = self.intersection_size / 2.0
+            dist_to_center = np.linalg.norm(self._agent_location - inter_pos)
+            if dist_to_center < edge:
+                current_in_intersection = True
+                # If we just entered this intersection (weren't in any intersection before)
+                if not self.was_in_intersection and inter["id"] not in self.intersections_crossed:
+                    reward += 50.0  # Bonus for crossing a new intersection
+                    self.intersections_crossed.add(inter["id"])
+                break
+        self.was_in_intersection = current_in_intersection
+        
+        # - running a red light (Increased penalty)
         if self._agent_runs_red_light():
-            reward -= 0.5
+            reward -= 50.0
+            
+        # - off-road penalty (New)
+        # Road boundaries: x in [250, 350] OR y in [250, 350]
+        # If outside these, agent is off-road
+        ax, ay = self._agent_location
+        on_road_x = 250 <= ax <= 350
+        on_road_y = 250 <= ay <= 350
+        if not (on_road_x or on_road_y):
+            reward -= 50.0
+            
         # - safety buffer proximity to NPC cars
         for car in self.npc_cars:
             if np.linalg.norm(car["pos"] - self._agent_location) < self.safety_buffer:
-                reward -= 0.1
+                reward -= 1.0 # Increased from 0.1
                 break
         # - zebra crossing with pedestrian on it
         if self._agent_on_active_crossing():
-            reward -= 2.0
+            reward -= 10.0 # Increased from 2.0
         
         # Terminations and success
         info = {
@@ -1059,15 +1101,27 @@ class UrbanCausalIntersectionEnv(gym.Env):
                 "traffic_density": self.traffic_density,
                 "pedestrian_density": self.pedestrian_density,
                 "driver_impatience": self.driver_impatience,
+                "npc_color": self.npc_color,
+                "npc_size": self.npc_size,
                 "roughness": self.roughness
             }
         }
         if collision:
             terminated = True
-            reward -= 100.0  # crash penalty
+            reward -= 1000.0  # crash penalty (Increased from 100)
         elif off_screen:
             terminated = True
-            reward += 10.0  # existing off-screen success bonus
+            if valid_exit and self.step_count >= self.minimum_steps_for_exit:
+                # Valid exit after minimum time requirement
+                reward += 300.0  # Success reward (increased from 200)
+                # Bonus for intersections crossed
+                reward += len(self.intersections_crossed) * 25.0
+                info["success"] = True
+            elif valid_exit and self.step_count < self.minimum_steps_for_exit:
+                # Too early exit - penalize
+                reward -= 200.0  # Penalty for leaving too early (reduced from 500)
+            else:
+                reward -= 1000.0 # Invalid exit (off-road) treated as crash
         else:
             # step-based success if alive for 59 seconds
             self.step_count += 1
@@ -1076,6 +1130,9 @@ class UrbanCausalIntersectionEnv(gym.Env):
                 info["success"] = True  # success signal; no extra reward requested
 
         observation = self._get_obs()
+        
+        # Track episode reward
+        self.episode_reward += reward
 
         if self.render_mode == "human":
             self._render_frame()
@@ -1141,6 +1198,17 @@ class UrbanCausalIntersectionEnv(gym.Env):
         # Draw roads: single vertical and horizontal cross
         pygame.draw.rect(canvas, (64, 64, 64), pygame.Rect(0, 250, 600, 100))  # horizontal
         pygame.draw.rect(canvas, (64, 64, 64), pygame.Rect(250, 0, 100, 600))  # vertical
+        
+        # Draw dashed center lines
+        # Horizontal road center line (y=300)
+        for x in range(0, 600, 40):
+            if not (250 <= x <= 350): # Skip intersection
+                pygame.draw.line(canvas, (255, 255, 255), (x, 300), (x + 20, 300), 2)
+        
+        # Vertical road center line (x=300)
+        for y in range(0, 600, 40):
+            if not (250 <= y <= 350): # Skip intersection
+                pygame.draw.line(canvas, (255, 255, 255), (300, y), (300, y + 20), 2)
         
         # Draw intersections and traffic lights
         for inter in self.intersections:
@@ -1258,13 +1326,22 @@ class UrbanCausalIntersectionEnv(gym.Env):
         front_pos = agent_pos + front_offset
         pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
 
-        # Render Temperature and Roughness Info
+        # Render info overlay
         if pygame.font:
             font = pygame.font.Font(None, 36)
+            # Environment info
             temp_text = font.render(f"Temp: {self.context.get('temperature', 20)} C", True, (255, 255, 255))
             rough_text = font.render(f"Roughness: {self.context.get('roughness', 0.0):.2f}", True, (255, 255, 255))
+            # Episode info
+            episode_text = font.render(f"Episode: {self.episode_count}", True, (255, 255, 255))
+            reward_text = font.render(f"Total Reward: {self.episode_reward:.1f}", True, (255, 255, 255))
+            step_text = font.render(f"Step: {self.step_count}", True, (255, 255, 255))
+            
             canvas.blit(temp_text, (10, 10))
             canvas.blit(rough_text, (10, 50))
+            canvas.blit(episode_text, (10, 90))
+            canvas.blit(reward_text, (10, 130))
+            canvas.blit(step_text, (10, 170))
 
         if self.render_mode == "human":
             self.window.blit(canvas, canvas.get_rect())

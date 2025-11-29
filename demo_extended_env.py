@@ -39,8 +39,8 @@ def demo_extended_environment():
     print("Press ESC, Ctrl+C, or close window to stop")
     print("=" * 70)
     
-    # Reset with default settings
-    obs, info = env.reset()
+    # Reset with default settings (low traffic/peds for demo)
+    obs, info = env.reset(options={"traffic_density": "low", "pedestrian_density": "low"})
     
     print(f"\nEnvironment reset!")
     print(f"  Car position: ({obs[0]:.0f}, {obs[1]:.0f})")
@@ -108,9 +108,9 @@ def demo_extended_environment():
                 print(f"Reason: {reason}")
                 print(f"Final reward: {reward:.2f}")
                 
-                # Reset for new episode
+                # Reset for new episode (random properties, but low density)
                 print("\nStarting new episode...")
-                obs, info = env.reset()
+                obs, info = env.reset(options={"traffic_density": "low", "pedestrian_density": "low"})
                 print(f"  Car position: ({obs[0]:.0f}, {obs[1]:.0f})")
                 print(f"  Car heading: {obs[4]:.2f} radians")
                 print(f"  Initial pedestrians: {info.get('num_pedestrians', 0)}")

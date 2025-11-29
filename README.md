@@ -441,12 +441,49 @@ gym-causal-intersection/
 ├── gym_causal_intersection/
 │   ├── __init__.py
 │   └── envs/
-│       ├── causal_intersection_env.py          # Simple environment
-│       └── causal_intersection_extended_env.py # Extended environment
-├── demo_env.py                                  # Interactive demo
-├── demo_extended_env.py                         # Extended demo
-├── test_env.py                                  # Unit tests
+│       ├── causal_intersection_env.py          # Core Environment: Main logic for the single-intersection environment
+│       └── causal_intersection_extended_env.py # Extended Environment: Larger map with multiple intersections
+├── train_optimized.py                           # Training: Optimized PPO training with vectorized environments (Fast)
+├── train_with_periodic_render.py                # Training: Original training script with periodic rendering
+├── run_fci_optimized.py                         # Causal Discovery: Optimized Fast Causal Inference (FCI) algorithm runner
+├── run_fci.py                                   # Causal Discovery: Basic FCI algorithm runner
+├── generate_causal_data.py                      # Data Generation: Generates observational data for causal discovery
+├── demo_env.py                                  # Demo: Interactive manual control for the single intersection
+├── demo_extended_env.py                         # Demo: Interactive manual control for the extended environment
+├── demo_causal_generation.py                    # Demo: Demonstrates data generation process
+├── verify_causal.py                             # Verification: Verifies causal relationships in generated data
+├── test_env.py                                  # Tests: Basic environment tests
+├── test_pedestrians.py                          # Tests: Specific tests for pedestrian behavior
+├── test_stationary_car.py                       # Tests: Tests for stationary car physics
+├── test_red_car.py                              # Tests: Tests for red light violation logic
+├── test_single_car.py                           # Tests: Tests for single car dynamics
+├── test_extended_env.py                         # Tests: Tests for the extended environment
+├── quick_test.py                                # Tests: Quick sanity check script
 └── README.md                                    # This file
+
+### File Descriptions
+
+#### Environment Core
+- **`gym_causal_intersection/envs/causal_intersection_env.py`**: The heart of the project. Contains the `UrbanCausalIntersectionEnv` class, defining the physics, rendering, reward function, and entity behaviors (cars, pedestrians, traffic lights) for the single intersection.
+- **`gym_causal_intersection/envs/causal_intersection_extended_env.py`**: Extends the core environment to support larger maps, multiple intersections, and a camera that follows the agent.
+
+#### Training
+- **`train_optimized.py`**: The recommended training script. It uses **vectorized environments** (running multiple instances in parallel) and tuned PPO hyperparameters to train the agent efficiently. It includes a callback to stop training when the reward threshold is reached.
+- **`train_with_periodic_render.py`**: An alternative training script that renders the environment periodically during training. Useful for debugging or watching progress, but slower than the optimized version.
+
+#### Causal Discovery & Data
+- **`generate_causal_data.py`**: Runs the environment with a random agent to collect observational data. It logs causal variables (temperature, traffic density, etc.) and outcomes to a CSV file.
+- **`run_fci_optimized.py`**: Uses the `causal-learn` library to run the **Fast Causal Inference (FCI)** algorithm on the generated data. It outputs a graph showing potential causal relationships (including latent confounders).
+- **`run_fci.py`**: A basic version of the FCI runner.
+- **`verify_causal.py`**: A utility to statistically verify specific causal links in the generated data.
+
+#### Demos & Visualization
+- **`demo_env.py`**: Allows you to manually control the agent (WASD keys) in the standard environment. Great for understanding the physics and rules.
+- **`demo_extended_env.py`**: Similar to `demo_env.py` but for the extended multi-intersection map.
+- **`demo_causal_generation.py`**: A visual demonstration of how data is collected for causal discovery.
+
+#### Tests
+- **`test_*.py`**: Various unit tests to ensure specific components (pedestrians, physics, red light logic) work as expected. `quick_test.py` is a fast sanity check.
 ```
 
 ## License

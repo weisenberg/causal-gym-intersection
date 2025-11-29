@@ -382,13 +382,15 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         if options and "npc_color" in options:
             self.npc_color = options["npc_color"]
         else:
-            self.npc_color = "random"
+            colors = ["random", "red", "blue", "green", "yellow", "white", "black"]
+            self.npc_color = self.np_random.choice(colors)
             
         # 6. NPC Size
         if options and "npc_size" in options:
             self.npc_size = options["npc_size"]
         else:
-            self.npc_size = "random"
+            sizes = ["random", "small", "medium", "large"]
+            self.npc_size = self.np_random.choice(sizes)
         
         # Update context
         self.context["temperature"] = self.temperature
@@ -693,8 +695,10 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             "state": "driving",  # driving, stopped_at_light, slowing_for_yellow, turning
             "road_type": spawn["type"],
             "direction": spawn.get("direction", "east"),  # Store direction for traffic light checking
-            "turn_decision": None,  # None, "left", "right", "straight" - decided at intersection
+            "direction": spawn.get("direction", "east"),  # Store direction for traffic light checking
+            "turn_decision": self.np_random.choice(["straight", "left", "right"], p=[0.6, 0.2, 0.2]),
             "has_turned": False,  # Track if car has completed turn at current intersection
+            "lateral_offset": 0.0, # For pedestrian avoidance
             "length": length,
             "width": width,
             "color": color
@@ -1052,28 +1056,113 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                     other_car["velocity"] = np.array([0.0, 0.0], dtype=np.float32)
                     other_car["target_speed"] = 0.0
             
-            # Keep car on road - RIGHT SIDE ONLY (prevent head-on collisions)
+            # --- Pedestrian Avoidance (Lateral Offset) ---
+            # Decay offset to return to center
+            car["lateral_offset"] = car.get("lateral_offset", 0.0) * 0.9
+            
+            # Check for pedestrians to steer around
+            for ped in self.pedestrians:
+                vec_to_ped = ped["pos"] - car["pos"]
+                dist_to_ped = float(np.linalg.norm(vec_to_ped))
+                if dist_to_ped < 80.0:
+                    # Project onto car's local frame
+                    fwd = np.array([np.cos(car["heading"]), -np.sin(car["heading"])])
+                    right = np.array([np.sin(car["heading"]), np.cos(car["heading"])])
+                    
+                    forward_dist = float(np.dot(vec_to_ped, fwd))
+                    lateral_dist = float(np.dot(vec_to_ped, right))
+                    
+                    # If pedestrian is ahead and slightly to side
+                    if 0 < forward_dist < 60.0 and abs(lateral_dist) < 20.0:
+                        # Steer away
+                        # If ped is right (lat > 0), steer left (offset -)
+                        # If ped is left (lat < 0), steer right (offset +)
+                        push = -2.0 if lateral_dist > 0 else 2.0
+                        car["lateral_offset"] += push
+            
+            # Clamp offset
+            car["lateral_offset"] = np.clip(car["lateral_offset"], -20.0, 20.0)
+
+            # Clamp offset
+            car["lateral_offset"] = np.clip(car["lateral_offset"], -20.0, 20.0)
+
+            # --- Lane Keeping Control (Heading Adjustment) ---
+            # Instead of forcing position, we adjust heading to steer towards the target lane position
+            
+            steering_correction = 0.0
+            target_h = car["heading"]
+            
             if car["road_type"] == "horizontal":
-                # Keep y position on right side of road based on direction
+                # Find nearest road center
                 nearest_road_y = min(self.horizontal_roads, 
                                     key=lambda r: abs(r["y"] - car["pos"][1]))["y"]
                 direction = car.get("direction", "east")
+                
                 if direction == "east":
-                    # Going left->right: bottom (south) side
-                    car["pos"][1] = nearest_road_y + self.road_width // 4
-                else:  # west (right->left): upper (north) side
-                    car["pos"][1] = nearest_road_y - self.road_width // 4
+                    # Target Y = Road Center + Lane Offset (Right/South) + Avoidance Offset
+                    base_y = nearest_road_y + self.road_width // 4
+                    target_y = base_y + car["lateral_offset"]
+                    base_heading = 0.0
+                    
+                    # P-Controller
+                    error = target_y - car["pos"][1]
+                    # Error > 0 (Need Down) -> Turn Right (Increase Heading)
+                    steering_correction = np.clip(error * 0.01, -0.2, 0.2)
+                    target_h = base_heading + steering_correction
+                    
+                else:  # west
+                    # Target Y = Road Center - Lane Offset (Top/North) - Avoidance Offset
+                    base_y = nearest_road_y - self.road_width // 4
+                    target_y = base_y - car["lateral_offset"]
+                    base_heading = np.pi
+                    
+                    # P-Controller
+                    error = target_y - car["pos"][1]
+                    # Error > 0 (Need Down) -> Turn Left (relative to West) -> Increase Heading
+                    steering_correction = np.clip(error * 0.01, -0.2, 0.2)
+                    target_h = base_heading + steering_correction
+                    
             else:  # vertical
-                # Keep x position on right side of road based on direction
+                # Find nearest road center
                 nearest_road_x = min(self.vertical_roads,
                                     key=lambda r: abs(r["x"] - car["pos"][0]))["x"]
                 direction = car.get("direction", "north")
+                
                 if direction == "north":
-                    # Going north: stay on right (east) side
-                    car["pos"][0] = nearest_road_x + self.road_width // 4
+                    # Target X = Road Center + Lane Offset (Right/East) + Avoidance Offset
+                    base_x = nearest_road_x + self.road_width // 4
+                    target_x = base_x + car["lateral_offset"]
+                    base_heading = np.pi / 2
+                    
+                    # P-Controller
+                    error = target_x - car["pos"][0]
+                    # Error > 0 (Need Right) -> Turn Right (relative to North) -> Decrease Heading
+                    steering_correction = np.clip(error * 0.01, -0.2, 0.2)
+                    target_h = base_heading - steering_correction
+                    
                 else:  # south
-                    # Going south: stay on left (west) side
-                    car["pos"][0] = nearest_road_x - self.road_width // 4
+                    # Target X = Road Center - Lane Offset (Left/West) - Avoidance Offset
+                    base_x = nearest_road_x - self.road_width // 4
+                    target_x = base_x - car["lateral_offset"]
+                    base_heading = -np.pi / 2
+                    
+                    # P-Controller
+                    error = target_x - car["pos"][0]
+                    # Error > 0 (Need Right) -> Turn Left (relative to South) -> Increase Heading
+                    steering_correction = np.clip(error * 0.01, -0.2, 0.2)
+                    target_h = base_heading + steering_correction
+
+            # Apply Steering with Non-Holonomic Constraint
+            # Only change heading if moving
+            speed = np.linalg.norm(car["velocity"])
+            if speed > 0.1:
+                # Smoothly interpolate to target heading
+                diff = target_h - car["heading"]
+                diff = (diff + np.pi) % (2 * np.pi) - np.pi
+                # Limit turn rate based on speed
+                max_turn = 0.05 * (speed / 5.0) + 0.01
+                step = np.clip(diff, -max_turn, max_turn)
+                car["heading"] += step
             
             # Remove if off screen
             if (car["pos"][0] < -200 or car["pos"][0] > self.map_size + 200 or
@@ -1803,6 +1892,19 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             pygame.draw.rect(canvas, (60, 60, 60),
                            pygame.Rect(road["x"] - self.road_width // 2, 0,
                                       self.road_width, self.map_size))
+                                      
+        # Draw dashed center lines
+        # Horizontal roads
+        for road in self.horizontal_roads:
+            y = road["y"]
+            for x in range(0, self.map_size, 40):
+                pygame.draw.line(canvas, (255, 255, 255), (x, y), (x + 20, y), 2)
+                
+        # Vertical roads
+        for road in self.vertical_roads:
+            x = road["x"]
+            for y in range(0, self.map_size, 40):
+                pygame.draw.line(canvas, (255, 255, 255), (x, y), (x, y + 20), 2)
         
         # Draw intersections
         for intersection in self.intersections:
