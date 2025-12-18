@@ -1,503 +1,111 @@
 # Gym Causal Intersection
 
-A Gymnasium environment for simulating urban traffic intersections with cars, pedestrians, and traffic lights. This environment is designed for reinforcement learning research, particularly for causal reinforcement learning applications.
-
-## Overview
-
-The environment simulates a 2D top-down urban intersection where an agent (a red car) must navigate safely while obeying traffic rules. The environment includes:
-
-- **Agent Vehicle**: A red car controlled by the RL agent
-- **NPC Cars**: Autonomous vehicles with varied attributes (speed, size, color) that follow traffic rules
-- **Pedestrians**: Blue pedestrians using zebra crossings and red jaywalkers crossing streets
-- **Traffic Lights**: Directional traffic lights at intersections with green/yellow/red phases
-- **Zebra Crossings**: Marked pedestrian crossings at intersections
-
-## Environment Specifications
-
-### Map Dimensions
-
-- **Window Size**: 600×600 pixels
-- **Road Width**: 100 pixels (roads span from 250 to 350 pixels in both x and y)
-- **Intersection Size**: 120×120 pixels (centered at 300, 300)
-- **Road Center**: 300 pixels (both horizontal and vertical roads)
-
-### Car Dimensions and Rendering
-
-#### Agent Car (Red)
-- **Length**: 20 pixels
-- **Width**: 10 pixels
-- **Center**: The car's position (`_agent_location`) represents the **center** of the car
-- **Rendering**: The car is drawn as a rotated rectangle (polygon) centered at `_agent_location`
-  - Corners are calculated relative to center: `[-length/2, -width/2]` to `[length/2, width/2]`
-  - Rotation matrix accounts for pygame's y-down coordinate system
-  - Heading: 0 = right (east), π/2 = up (north), π = left (west), -π/2 = down (south)
-
-#### NPC Cars
-- **Length**: Variable (default 20, can range from 18-25 pixels)
-- **Width**: Variable (default 10, can range from 8-15 pixels)
-- **Center**: Each NPC car's `pos` represents the **center** of the car
-- **Rendering**: Same as agent car, but with varied colors (rainbow shades)
-- **Attributes**: Each NPC car has individual:
-  - `cruise_speed`: Target speed (2.5-4.5 pixels/step)
-  - `accel`: Acceleration rate (0.2-0.3)
-  - `brake_factor`: Braking efficiency (0.85-0.95)
-  - `stopping_distance`: Distance at which to start braking (30-50 pixels)
-  - `color`: RGB tuple (rainbow shades)
-
-**Important**: All car positions (`_agent_location` for agent, `car["pos"]` for NPCs) represent the **geometric center** of the vehicle. Collision detection uses bounding circles with radius `max(length, width) / 2.0` to account for the full car footprint.
-
-### Right-Side Driving Rule
-
-NPC cars follow right-side driving rules based on their direction:
-
-- **Eastbound** (left to right): Bottom side of horizontal road (y = 330)
-- **Westbound** (right to left): Upper side of horizontal road (y = 270)
-- **Northbound** (bottom to top): Right side of vertical road (x = 320)
-- **Southbound** (top to bottom): Left side of vertical road (x = 280)
-
-This prevents head-on collisions and ensures realistic traffic flow.
-
-## Temperature-Dependent Physics
-
-The environment simulates weather conditions through a **Temperature** system that affects road physics:
-
-- **Temperature Range**: `-10°C` to `30°C`
-- **Roughness**: Derived from temperature (0.0 at -10°C to 1.0 at 30°C)
-
-### Effects
-1. **Friction**:
-   - **Low Temp (-10°C)**: Icy/Slippery. Lower friction coefficient.
-   - **High Temp (30°C)**: Dry/Grippy. Higher friction coefficient.
-   - *Note*: The Agent car has been decoupled from this friction limit to allow for trial-and-error learning (it can accelerate fully but will slide/fail to stop on ice).
-
-2. **Braking Distance**:
-   - **Icy**: Braking efficiency is reduced (40% power), resulting in significantly longer stopping distances.
-   - **Dry**: Normal braking efficiency (100% power).
-
-3. **NPC Behavior**:
-   - NPC cars automatically drive slower and start braking earlier on icy roads to maintain safety.
-
-## Causal RL Features
-
-This environment is specifically designed for **Causal Reinforcement Learning** (CRL) research. It supports **Domain Randomization** and **Interventions** on key causal variables (confounders).
-
-### Causal Variables
-
-| Variable | Type | Values / Range | Effect |
-| :--- | :--- | :--- | :--- |
-| **`temperature`** | Discrete | `[-10, 0, 10, 20, 30]` | Friction, Braking, NPC Speed |
-| **`traffic_density`** | Discrete | `['low', 'medium', 'high']` | Number of NPC cars |
-| **`pedestrian_density`** | Discrete | `['low', 'medium', 'high']` | Number of pedestrians |
-| **`driver_impatience`** | Continuous | `0.0` to `1.0` | NPC Acceleration, Speed, Aggressiveness |
-| **`npc_color`** | Categorical | `random`, `red`, `blue`, ... | Visual appearance of ALL cars (Spurious correlation) |
-| **`npc_size`** | Categorical | `random`, `small`, `medium`, `large` | Physical size of ALL cars |
-
-### Usage
-
-#### 1. Observational Data (Randomized)
-By default, `reset()` randomizes all causal variables to generate diverse observational data.
-```python
-obs, info = env.reset()
-print(info["causal_vars"]) 
-# {'temperature': -10, 'traffic_density': 'high', ...}
-```
-
-#### 2. Interventions (Do-Calculus)
-You can perform interventions by forcing specific values using the `options` dictionary. This allows for counterfactual reasoning and bias testing.
-```python
-# Intervention: Force Icy Roads and Red Cars
-options = {
-    "temperature": -10,
-    "npc_color": "red"
-}
-obs, info = env.reset(options=options)
-```
-
-#### 3. Data Extraction
-The `info` dictionary returned by `reset()` and `step()` contains the ground truth causal state under the key `causal_vars`.
-
-## Action Space
-
-The action space is **continuous** with 2 dimensions:
-
-```python
-action_space = Box(low=[-1.0, -1.0], high=[1.0, 1.0], dtype=np.float32)
-```
-
-- **Action[0]**: Acceleration command
-  - `1.0`: Accelerate forward
-  - `-1.0`: Brake (until stop, no reverse)
-  - `0.0`: No acceleration/braking
-- **Action[1]**: Steering command
-  - `1.0`: Turn left (counterclockwise)
-  - `-1.0`: Turn right (clockwise)
-  - `0.0`: No steering
-
-**Physics**:
-- Acceleration: `0.3` pixels/step²
-- Angular velocity: `0.1` radians/step
-- Max speed: `5.0` pixels/step
-- No-slide physics: Velocity vector aligns with heading when moving
-- Friction: Applied when moving (default `1.0`, no decay)
-
-**Braking Behavior**: When braking (action[0] < 0), the car applies negative acceleration but **cannot reverse**. If velocity would go negative along the heading direction, it's clamped to zero.
-
-## Observation Space
-
-The observation space is **configurable** via `observation_type` parameter:
-
-### Kinematic Observations (Default)
-
-```python
-observation_space = Box(low=-inf, high=inf, shape=(55,), dtype=np.float32)
-```
-
-The 55-dimensional vector concatenates:
-
-1. **Agent State** (5 dims):
-   - `[pos_x, pos_y, vel_x, vel_y, heading]`
-
-2. **LIDAR Sensors** (16 dims):
-   - `[dist_0, dist_1, ..., dist_15]`
-   - 16 rays evenly spaced in 360° around the agent
-   - Max range: 200 pixels
-   - Detects NPC cars, pedestrians, and map boundaries
-
-3. **Nearest k=5 Cars** (20 dims):
-   - For each of the 5 nearest NPC cars:
-   - `[rel_pos_x, rel_pos_y, rel_vel_x, rel_vel_y]`
-   - Relative position and velocity to agent
-   - Padded with zeros if fewer than 5 cars exist
-
-4. **Nearest k=5 Pedestrians** (10 dims):
-   - For each of the 5 nearest pedestrians:
-   - `[rel_pos_x, rel_pos_y]`
-   - Relative position to agent
-   - Padded with zeros if fewer than 5 pedestrians exist
-
-5. **Next Traffic Light** (4 dims):
-   - `[is_red, is_yellow, is_green, time_to_change]`
-   - One-hot encoding of light state for agent's direction
-   - Time to change: normalized remaining time in current phase
-
-### Pixel Observations
-
-```python
-observation_space = Box(low=0, high=255, shape=(84, 84, 3), dtype=np.uint8)
-```
-
-- RGB array from the render function, resized to 84×84
-- Top-down view of the entire 600×600 map
-- Includes all visual elements (roads, cars, pedestrians, traffic lights, zebra crossings)
-
-## Reward Function
-
-The reward is **dense and shaped**, computed and applied **at every step** as the agent moves around. The total reward for each step is the sum of multiple components:
-
-### Positive Rewards (Per Step)
-
-- **Survival Reward**: `+0.1` **every step** (encourages staying alive)
-- **Progress/Efficiency Reward**: `+1.0 * (agent_speed / max_speed)` **every step** (encourages forward movement)
-  - This reward scales with speed: faster movement = higher reward
-  - At max speed (5.0), this gives `+1.0` per step
-  - At half speed (2.5), this gives `+0.5` per step
-  - When stationary, this gives `+0.0`
-
-### Positive Rewards (Termination Only)
-
-- **Successful Exit**: `+10.0` when agent leaves the map without collision (episode terminates)
-
-### Negative Rewards (Per Step)
-
-- **Red Light Violation**: `-0.5` **every step** while running a red light
-- **Safety Buffer Proximity**: `-0.1` **every step** while within `safety_buffer` distance of an NPC car
-- **Zebra Crossing with Pedestrian**: `-2.0` **every step** while agent is on a zebra crossing with a pedestrian on it
-
-### Negative Rewards (One-Time Events)
-
-- **Hitting NPC Car**: `-10.0` when collision occurs (episode continues, penalty applied once per collision)
-- **Crash Penalty**: `-100.0` when hitting a pedestrian/jaywalker (episode terminates - worst case)
-
-### Reward Calculation Example
-
-At each step, the reward is calculated as:
-```
-reward = +0.1                                    # Survival
-       + 1.0 * (speed / max_speed)               # Progress (0.0 to 1.0)
-       - 0.5 if running_red_light                 # Red light penalty
-       - 0.1 if near_npc_car                     # Proximity penalty
-       - 2.0 if on_crossing_with_pedestrian       # Crossing penalty
-       - 10.0 if hit_npc_car                      # NPC collision (one-time)
-       - 100.0 if hit_pedestrian                  # Pedestrian collision (one-time, terminates)
-       + 10.0 if off_screen_safely                # Success bonus (one-time, terminates)
-```
-
-**Note**: The survival and progress rewards are given **every step**, encouraging continuous safe movement. The agent accumulates rewards as it navigates the environment.
-
-### Termination Conditions
-
-The episode terminates when:
-1. **Pedestrian Collision**: Agent hits a pedestrian or jaywalker → `-100.0` reward
-2. **Off-Screen**: Agent leaves the map boundaries → `+10.0` reward (success)
-3. **Time Limit Success**: Agent survives for 59 seconds (1770 steps at 30 FPS) without collision → `info["success"] = True`
-
-## NPC Car Collision Avoidance
-
-NPC cars implement sophisticated collision avoidance to prevent deadlocks and ensure realistic behavior:
-
-### Detection Logic
-
-1. **Initialization**: Each step, NPC cars assume the front is clear (`target_speed = cruise_speed`)
-
-2. **Traffic Light Check**: 
-   - Stop before intersection if light is red/yellow
-   - Distance: `stopping_distance` (30-50 pixels) before intersection edge
-   - If inside intersection, clear it regardless of light state
-
-3. **Obstacle Detection (Front-Only)**:
-   - **Agent Car**: Only react if agent is ahead within 60° cone (`cos_angle > 0.5` and `dist_along > 10`)
-   - **Pedestrians**: Only react if pedestrian is ahead within 60° cone (front-only, not sides/back)
-   - **Other NPC Cars**: Only react if other car is ahead within 60° cone (front/back alignment for cars)
-
-4. **Speed Adjustment**:
-   - **Immediate Stop**: If obstacle within `min_margin` (car width + 6 pixels)
-   - **Slow Down**: If obstacle within `stopping_distance`:
-     - Within 60% of stopping distance: `target_speed = 20% of cruise_speed`
-     - Within stopping distance: `target_speed = 50% of cruise_speed`
-
-5. **Deadlock Prevention**:
-   - If no obstacles detected in front and not stopped at light → `target_speed = cruise_speed`
-   - Cars continue moving when front is clear, preventing intersection deadlocks
-
-### Final Collision Resolver
-
-After physics update, a final separation pass ensures no geometric overlap:
-
-- **Car-to-Car**: Uses `max(length, width) / 2.0` as bounding radius
-  - Only resolves if cars are aligned front/back (`abs(cos_angle) > 0.5`)
-  - Pushes cars apart and sets `target_speed = 0.0` (can resume next step if clear)
-
-- **Car-to-Pedestrian**: Uses car's bounding radius + pedestrian radius
-  - Only resolves if pedestrian is in front (`cos_angle > 0.5` and `dist_along > 10`)
-  - Pushes car away and stops it
-
-- **Stopped Cars**: If a car is stopped (speed < 0.1 and target_speed < 0.1), it **cannot be pushed** by cars behind it. Only the moving car gets repositioned.
-
-## Traffic Lights
-
-### Directional Traffic Lights
-
-Each intersection has **4 directional traffic lights** (one per approach: north, south, east, west):
-
-- **4-Phase Cycle**:
-  1. Phase 0: North-South green (30 steps), East-West red
-  2. Phase 1: North-South yellow (5 steps), East-West red
-  3. Phase 2: East-West green (30 steps), North-South red
-  4. Phase 3: East-West yellow (5 steps), North-South red
-
-- **Synchronization**: Lights are synchronized in pairs (2×2):
-  - North-South: Synchronized (both same state)
-  - East-West: Synchronized (both same state)
-  - Perpendicular pairs alternate (when N-S is green, E-W is red)
-
-### Pedestrian Traffic Light Interaction
-
-- Pedestrians wait for **perpendicular traffic** to be red before crossing
-- If a pedestrian is already on a crossing when the light turns green, they **continue crossing** to completion
-- This prevents pedestrians from being stranded in the middle of the road
-
-## Pedestrians
-
-### Types
-
-1. **Regular Pedestrians** (Blue):
-   - Spawn at intersection corners
-   - Always use zebra crossings
-   - Follow traffic light rules (wait for perpendicular traffic to be red)
-
-2. **Jaywalkers** (Red):
-   - Spawn on road sides (not at intersections)
-   - Cross streets directly (perpendicular to road)
-   - Do not use zebra crossings
-   - Do not follow traffic lights
-
-### Behavior
-
-- **Crossing Phases**:
-  1. `to_crossing`: Move to zebra crossing start
-  2. `on_crossing`: Move along zebra crossing (hard constraint keeps them on the line)
-  3. `to_destination`: Move to destination corner
-
-- **Hard Constraint**: Regular pedestrians are forced to stay exactly on the zebra crossing line during the `on_crossing` phase
-
-- **Speed**: `2.0` pixels/step
-
-- **Radius**: `5` pixels (for collision detection)
-
-## Usage
-
-### Basic Usage
-
-```python
-import gymnasium as gym
-import gym_causal_intersection
-
-# Create environment
-env = gym.make('UrbanCausalIntersection-v0', render_mode='human')
-
-# Reset
-obs, info = env.reset(seed=42)
-
-# Step
-action = np.array([1.0, 0.0])  # Accelerate forward, no steering
-obs, reward, terminated, truncated, info = env.step(action)
-
-# Close
-env.close()
-```
-
-### Configuration
-
-```python
-# With kinematic observations (default)
-env = gym.make('UrbanCausalIntersection-v0', observation_type='kinematic')
-
-# With pixel observations
-env = gym.make('UrbanCausalIntersection-v0', observation_type='pixel')
-
-# With custom context
-obs, info = env.reset(seed=42, options={
-    'pedestrian_spawn_rate': 0.05,
-    'num_pedestrians': 8,
-    'jaywalk_probability': 0.15,
-    'traffic_light_duration': 30
-})
-```
-
-### Interactive Demo
-
-Run the demo script for manual control:
+A Gymnasium environment for simulating urban traffic scenarios, designed for **Causal Reinforcement Learning (CRL)** research. It features autonomous traffic, pedestrians, traffic lights, and configurable causal confounders (weather, traffic density, etc.).
+
+## Environments
+
+### 1. SimpleCausalIntersection-v0 (New & Recommended)
+A simplified, "infinite" vertical road environment designed for faster training and clear causal analysis.
+- **Goal**: Drive as far north/south as possible without crashing.
+- **Features**:
+  - **Infinite Road**: The road extends indefinitely (visually loops/extends), allowing for long-distance driving.
+  - **Randomized Layout**: At each reset, the road's rotation and position are randomized, forcing the agent to generalize rather than memorize coordinates.
+  - **Randomized Spawn**: Agent spawns with a random heading offset ($\pm 28^\circ$), requiring immediate steering correction.
+  - **Discrete Actions**: Simplified action space (Idle, Accelerate, Brake, Left, Right).
+  - **Spurious Correlations**: Visual features like NPC car color and size can be randomized to test agent robustness against non-causal factors.
+
+### 2. UrbanCausalIntersection-v0
+The original complex environment with a 4-way intersection.
+- **Features**: Full traffic light cycles, turning lanes, and complex right-of-way rules.
+- **Continuous Actions**: Fine-grained steering and acceleration control.
+
+## Installation
 
 ```bash
-python demo_env.py
+pip install -e .
 ```
 
-**Controls** (WASD):
-- **W**: Accelerate forward
-- **S**: Brake (until stop)
-- **A**: Turn left
-- **D**: Turn right
-- **ESC**: Close environment
+## Quick Start
 
-## Extended Environment
+### Interactive Demo
+Manually control the car to get a feel for the physics and rules.
 
-There is also an extended environment (`UrbanCausalIntersectionExtended-v0`) with:
+**Simple Environment (Recommended):**
+```bash
+python demo_simple_env.py
+```
+**Controls (WASD):**
+- `W`: Accelerate
+- `S`: Brake
+- `A`: Steer Left
+- `D`: Steer Right
 
-- **Larger Map**: Configurable size (default 2000×2000 pixels)
-- **Multiple Intersections**: 3-way and 4-way intersections
-- **More Roads**: Longer streets connecting intersections
-- **Camera Following**: Camera follows agent in larger map
-- **Same Features**: All features from simple environment (NPC cars, pedestrians, traffic lights, etc.)
+### Training Agents
+We provide scripts to train **PPO** and **DQN** agents on the `SimpleCausalIntersection-v0` environment.
 
-## Technical Details
+**DQN (Best Performance):**
+```bash
+python train_dqn_viz.py
+```
+- **Results**: Converges to consistent success (reaching the goal) even with randomized layouts and starting headings.
+- **Output**: Saves plots and videos to `videos_dqn_random/`.
 
-### Coordinate System
+**PPO:**
+```bash
+python train_viz.py
+```
+- **Note**: PPO currently struggles with this specific discrete/randomized setup compared to DQN.
 
-- **Origin**: Top-left corner (0, 0)
-- **X-axis**: Increases rightward (0 to 600)
-- **Y-axis**: Increases downward (0 to 600) - **pygame convention**
-- **Heading**: 0 = right (east), π/2 = up (north), π = left (west), -π/2 = down (south)
+## Causal Discovery
+The project includes a pipeline to generate data and discover the underlying causal graph of the environment using the **FCI (Fast Causal Inference)** algorithm.
 
-### Physics
+1.  **Generate Data**:
+    Run the agent (random or trained) to collect interaction data.
+    ```bash
+    python generate_simple_data.py
+    ```
+    - Generates `simple_env_data.csv` (default: 1,000,000 steps).
 
-- **Velocity**: 2D vector `[vx, vy]` in pixels/step
-- **Heading**: Angle in radians (0 to 2π)
-- **No-Slide**: When moving, velocity vector is aligned with heading direction
-- **Friction**: Applied per step (default `1.0` = no decay)
+2.  **Run FCI Algorithm**:
+    Analyze the data to reconstruct the causal graph.
+    ```bash
+    python run_fci_optimized.py
+    ```
+    - **Output**: `causal_graph_fci_optimized.png`
+    - **Outcome**: Successfully recovers the true causal links (e.g., `Traffic Light -> Agent Speed`, `Brake -> Velocity`) while correctly identifying confounders.
 
-### Collision Detection
+## Key Features for Research
 
-- **Agent-to-Pedestrian**: Circle-to-circle (agent: `car_width/2`, pedestrian: `pedestrian_radius`)
-- **Agent-to-NPC-Car**: Circle-to-circle (both use `max(length, width)/2.0` as radius)
-- **NPC-to-NPC**: Circle-to-circle with directional checks (front/back only)
-- **NPC-to-Pedestrian**: Circle-to-circle with directional checks (front-only)
+### Domain Randomization
+The environment supports extensive randomization to prevent overfitting and test generalization:
+- **Layout**: Rotation and center position of the road.
+- **Spawn Conditions**: Initial position and heading.
+- **Visuals**: NPC car colors (red, blue, rainbow) and sizes.
+- **Physics**: Friction and braking efficiency based on "Temperature".
 
-### Rendering
-
-- **Framework**: Pygame
-- **Frame Rate**: 30 FPS
-- **Background**: Gray (128, 128, 128)
-- **Roads**: Dark gray (64, 64, 64)
-- **Intersections**: Medium gray (80, 80, 80)
-- **Agent Car**: Red (255, 0, 0)
-- **NPC Cars**: Rainbow shades (varied)
-- **Pedestrians**: Blue (100, 100, 255) for regular, Red (255, 100, 100) for jaywalkers
-- **Traffic Lights**: Green (0, 255, 0), Yellow (255, 255, 0), Red (255, 0, 0)
+### Causal Variables
+The environment exposes ground-truth causal variables in the `info` dictionary, allowing for direct verification of causal discovery algorithms.
+- `temperature`: Affects physics (friction).
+- `traffic_density`: Affects NPC count.
+- `driver_impatience`: Affects NPC acceleration/behavior.
 
 ## File Structure
-
-```
-gym-causal-intersection/
-├── gym_causal_intersection/
-│   ├── __init__.py
-│   └── envs/
-│       ├── causal_intersection_env.py          # Core Environment: Main logic for the single-intersection environment
-│       └── causal_intersection_extended_env.py # Extended Environment: Larger map with multiple intersections
-├── train_optimized.py                           # Training: Optimized PPO training with vectorized environments (Fast)
-├── train_with_periodic_render.py                # Training: Original training script with periodic rendering
-├── run_fci_optimized.py                         # Causal Discovery: Optimized Fast Causal Inference (FCI) algorithm runner
-├── run_fci.py                                   # Causal Discovery: Basic FCI algorithm runner
-├── generate_causal_data.py                      # Data Generation: Generates observational data for causal discovery
-├── demo_env.py                                  # Demo: Interactive manual control for the single intersection
-├── demo_extended_env.py                         # Demo: Interactive manual control for the extended environment
-├── demo_causal_generation.py                    # Demo: Demonstrates data generation process
-├── verify_causal.py                             # Verification: Verifies causal relationships in generated data
-├── test_env.py                                  # Tests: Basic environment tests
-├── test_pedestrians.py                          # Tests: Specific tests for pedestrian behavior
-├── test_stationary_car.py                       # Tests: Tests for stationary car physics
-├── test_red_car.py                              # Tests: Tests for red light violation logic
-├── test_single_car.py                           # Tests: Tests for single car dynamics
-├── test_extended_env.py                         # Tests: Tests for the extended environment
-├── quick_test.py                                # Tests: Quick sanity check script
-└── README.md                                    # This file
-
-### File Descriptions
-
-#### Environment Core
-- **`gym_causal_intersection/envs/causal_intersection_env.py`**: The heart of the project. Contains the `UrbanCausalIntersectionEnv` class, defining the physics, rendering, reward function, and entity behaviors (cars, pedestrians, traffic lights) for the single intersection.
-- **`gym_causal_intersection/envs/causal_intersection_extended_env.py`**: Extends the core environment to support larger maps, multiple intersections, and a camera that follows the agent.
-
-#### Training
-- **`train_optimized.py`**: The recommended training script. It uses **vectorized environments** (running multiple instances in parallel) and tuned PPO hyperparameters to train the agent efficiently. It includes a callback to stop training when the reward threshold is reached.
-- **`train_with_periodic_render.py`**: An alternative training script that renders the environment periodically during training. Useful for debugging or watching progress, but slower than the optimized version.
-
-#### Causal Discovery & Data
-- **`generate_causal_data.py`**: Runs the environment with a random agent to collect observational data. It logs causal variables (temperature, traffic density, etc.) and outcomes to a CSV file.
-- **`run_fci_optimized.py`**: Uses the `causal-learn` library to run the **Fast Causal Inference (FCI)** algorithm on the generated data. It outputs a graph showing potential causal relationships (including latent confounders).
-- **`run_fci.py`**: A basic version of the FCI runner.
-- **`verify_causal.py`**: A utility to statistically verify specific causal links in the generated data.
-
-#### Demos & Visualization
-- **`demo_env.py`**: Allows you to manually control the agent (WASD keys) in the standard environment. Great for understanding the physics and rules.
-- **`demo_extended_env.py`**: Similar to `demo_env.py` but for the extended multi-intersection map.
-- **`demo_causal_generation.py`**: A visual demonstration of how data is collected for causal discovery.
-
-#### Tests
-- **`test_*.py`**: Various unit tests to ensure specific components (pedestrians, physics, red light logic) work as expected. `quick_test.py` is a fast sanity check.
-```
-
-## License
-
+- `gym_causal_intersection/envs/`: Environment source code.
+  - `simple_causal_env.py`: The infinite vertical road env.
+  - `causal_intersection_env.py`: Base class and 4-way intersection env.
+- `train_dqn_viz.py`: Main DQN training script.
+- `train_viz.py`: Main PPO training script.
+- `demo_simple_env.py`: Manual control demo.
+- `generate_simple_data.py`: Causal data generation.
+- `run_fci_optimized.py`: Causal graph discovery.
 
 ## Citation
-
-If you use this environment in your research, please cite:
-
+If you use this environment, please cite:
 ```bibtex
 @software{gym_causal_intersection,
   title={Gym Causal Intersection: A Reinforcement Learning Environment for Urban Traffic},
-  author={[Ali Khadangi]},
+  author={Ali Khadangi},
   year={2025},
-  url={[https://github.com/weisenberg/causal-gym-intersection]}
+  url={https://github.com/weisenberg/causal-gym-intersection}
 }
 ```

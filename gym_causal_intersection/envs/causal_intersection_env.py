@@ -129,7 +129,9 @@ class UrbanCausalIntersectionEnv(gym.Env):
         spawn_idx = self.np_random.integers(0, len(self._car_spawn_points))
         car_spawn = self._car_spawn_points[spawn_idx]
         self._agent_location = car_spawn["pos"].copy().astype(np.float32)
-        self._agent_heading = float(car_spawn["heading"])
+        # Add random noise to heading (+/- 0.5 radians approx +/- 28 deg)
+        heading_noise = self.np_random.uniform(-0.5, 0.5)
+        self._agent_heading = float(car_spawn["heading"] + heading_noise)
         self._agent_velocity = np.array([0.0, 0.0], dtype=np.float32)
         
         # --- Causal RL: Domain Randomization & Interventions ---
