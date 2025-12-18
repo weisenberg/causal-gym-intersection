@@ -1770,40 +1770,55 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                 collision_with_pedestrian = True
                 break
         
-        # Shaped rewards
-        # + survival
-        reward += 0.1
-        # + progress/efficiency
-        agent_speed = float(np.linalg.norm(self._agent_velocity))
-        reward += 1.0 * (agent_speed / max(1e-6, self.max_speed))
-
-        # - safety buffer proximity to other cars
-        for car in self.npc_cars:
-            if np.linalg.norm(car["pos"] - self._agent_location) < self.safety_buffer:
-                reward -= 0.1
-                break
-
-        # - running a red light
+        # --- Reward Structure (Standardized) ---
+        # 1. Time penalty (encourage efficiency)
+        reward -= 0.05
+        
+        # 2. Speed Reward
+        speed = np.linalg.norm(self._agent_velocity)
+        if speed > 0.1:
+            reward += 0.01 * speed
+    
+        # 3. Red Light Penalty
         if self._agent_runs_red_light():
             reward -= 0.5
-
-        # - zebra crossing while pedestrian on it
-        if self._agent_on_active_crossing():
-            reward -= 2.0
-
-        # Termination conditions
+            
+        # 4. Termination Conditions
         if collision_with_pedestrian:
             terminated = True
-            reward -= 100.0  # crash penalty
+            reward = -100.0  # Collision (Car/Pedestrian)
         elif off_screen:
             terminated = True
-            reward += 10.0  # successful exit bonus (kept as before)
-        
+            
+            # Check if exit was valid (on road)
+            # Extended env has multiple roads. Check if agent is within any road's width.
+            valid_exit = False
+            x, y = self._agent_location
+            
+            # Check horizontal roads
+            for road in self.horizontal_roads:
+                # Check if y is within road width
+                if abs(y - road["y"]) <= self.road_width / 2 + 5: # +5 tolerance
+                    valid_exit = True
+                    break
+                    
+            # Check vertical roads
+            if not valid_exit:
+                for road in self.vertical_roads:
+                    # Check if x is within road width
+                    if abs(x - road["x"]) <= self.road_width / 2 + 5: # +5 tolerance
+                        valid_exit = True
+                        break
+            
+            if valid_exit:
+                reward = 100.0  # Success (Valid Exit)
+            else:
+                reward = -10.0 # Off-Road Exit
+            
         observation = self._get_obs()
         info = {
             "num_pedestrians": len(self.pedestrians),
             "num_npc_cars": len(self.npc_cars),
-            "collision_with_pedestrian": collision_with_pedestrian,
             "collision_with_pedestrian": collision_with_pedestrian,
             "agent_speed": float(np.linalg.norm(self._agent_velocity)),
             "causal_vars": {

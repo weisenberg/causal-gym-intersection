@@ -10,3 +10,8 @@ register(
     entry_point='gym_causal_intersection.envs.causal_intersection_extended_env:UrbanCausalIntersectionExtendedEnv',
 )
 
+register(
+    id='SimpleCausalIntersection-v0',
+    entry_point='gym_causal_intersection.envs.simple_causal_env:SimpleCausalIntersectionEnv',
+)
+
