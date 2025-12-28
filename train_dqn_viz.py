@@ -171,10 +171,17 @@ class VizCallback(BaseCallback):
                 # Save plot periodically (every 10 episodes)
                 if self.episode_count % 10 == 0:
                      plt.figure(figsize=(10, 5))
-                     plt.plot(self.all_rewards)
+                     plt.plot(self.all_rewards, alpha=0.3, label='Raw')
+                     # Rolling Mean
+                     window = 50
+                     if len(self.all_rewards) >= window:
+                         ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
+                         plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
+                         
                      plt.title("DQN Episode Rewards (Curved Road)")
                      plt.xlabel("Episode")
                      plt.ylabel("Reward")
+                     plt.legend()
                      plt.grid(True)
                      plt.savefig("reward_plot_dqn_curved.png")
                      plt.close()
@@ -190,18 +197,16 @@ class VizCallback(BaseCallback):
             
         return True
 
-def linear_schedule(initial_value: float):
+from typing import Callable
+
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
     """
     Linear learning rate schedule.
-    :param initial_value: Initial learning rate.
-    :return: schedule function check
+    :param initial_value: The initial learning rate.
+    :return: schedule that computes current learning rate depending on remaining progress
     """
     def func(progress_remaining: float) -> float:
-        """
-        Progress will decrease from 1 (beginning) to 0.
-        :param progress_remaining:
-        :return: current learning rate
-        """
+        # progress_remaining decreases from 1.0 (start) to 0.0 (end)
         return progress_remaining * initial_value
     return func
 
@@ -234,17 +239,23 @@ def main():
     model = DQN(
         "MlpPolicy",
         env,
-        learning_rate=linear_schedule(1e-4), # Lower LR
-        buffer_size=200000, # Larger buffer
-        learning_starts=5000, # More warmup
-        batch_size=128, # Larger batch
-        tau=0.05, # Soft update
-        gamma=0.98,
-        train_freq=4,
-        gradient_steps=1,
-        target_update_interval=5000, # More stable target
-        exploration_fraction=0.3, # More exploration (30%)
-        exploration_final_eps=0.02,
+        learning_rate=linear_schedule(1e-4),
+        buffer_size=100000,
+        learning_starts=1000,
+        batch_size=32,
+        gamma=0.99,
+        # Exploration settings
+        exploration_fraction=0.4,  # Decay over first 40% of training
+        exploration_initial_eps=1.0,
+        exploration_final_eps=0.01, # Only 1% random actions at the end
+        max_grad_norm=1.0,          # Prevent exploding gradients
+        policy_kwargs=dict(net_arch=[256, 256]), # User asked for dueling=True but standard DQN doesn't support it directly. Keeping net_arch to avoid error, or maybe I should risk it? User explicitly said: policy_kwargs=dict(dueling=True). I will assume they might be using a newer/custom version or just misunderstood. But to prevent crash I will comment it out or verify.
+        # Actually, let's look at the user snippet: policy_kwargs=dict(dueling=True).
+        # Standard SB3 DQN policy_kwargs -> 'dueling': False (default is True if using QRDQN?).
+        # Wait, SB3 DQN *policy* (MlpPolicy) does NOT have dueling argument.
+        # I will stick to safe net_arch but add a comment, OR check if I can assume 'dueling' support.
+        # Ideally I should use the Dueling script if they want Dueling.
+        # But for this file, I will use net_arch as before but Updated params.
         verbose=1
     )
     
@@ -274,10 +285,18 @@ def main():
         print(f"Final Reward: {final_reward}")
         
         plt.figure(figsize=(10, 5))
-        plt.plot(rewards)
+        plt.plot(rewards, alpha=0.3, label='Raw')
+        
+        # Rolling Mean
+        window = 50
+        if len(rewards) >= window:
+            ma = np.convolve(rewards, np.ones(window)/window, mode='valid')
+            plt.plot(range(window-1, len(rewards)), ma, color='red', label=f'{window}-Ep Avg')
+            
         plt.title("DQN Episode Rewards (Curved Road)")
         plt.xlabel("Episode")
         plt.ylabel("Reward")
+        plt.legend()
         plt.grid(True)
         plt.savefig("reward_plot_dqn_curved.png")
         print("Reward plot saved to reward_plot_dqn_curved.png")

@@ -7,24 +7,27 @@ A Gymnasium environment for simulating urban traffic scenarios, designed for **C
 ### 1. SimpleCausalIntersection-v0 (Curved Road Edition)
 A procedural "infinite" spline-based road environment designed for robust driving and causal reasoning.
 - **Goal**: Drive as far as possible along the curved lane without crashing or violating traffic rules.
-- **Features**:
-  - **Procedural Spline Road**: The road is generated using splines, creating challenging curves instead of a straight line.
-  - **Infinite Runner**: When the agent reaches the end, it is teleported back to the start (preserving momentum) for continuous training.
-  - **Periodic Traffic Lights**: Implemented at fixed waypoints (Indices 100, 300).
-    - **State Machine**: Cycles through Green -> Yellow -> Red.
-    - **Penalties**: Running a Red Light results in a severe penalty (-50.0) and immediate episode termination.
-    - **Pedestrian Sync**: Pedestrians only attempt to cross the road when the traffic light is Red for vehicles.
-  - **Dynamic Physics**: Lidar range and braking efficiency are affected by the environment's `temperature` (Causal Confounder).
-  - **Observation Space**: 107-dimensional vector including:
-    - Agent State (Vel, Heading, CTE)
-    - **Lidar**: 8 Rays with dynamic range (visualized in Yellow/Red).
-    - **Traffic Light**: One-hot encoding (Green/Yellow/Red) + Distance to next light.
-    - Nearby Entities (NPCs, Pedestrians).
+    - **Features**:
+      - **Procedural Spline Road**: The road is generated using splines, creating challenging curves.
+      - **Infinite Runner**: Continuous driving loop.
+      - **"Move or Die" Logic**:
+        - **Strict Termination**: If the agent's speed drops below **2.0 m/s** for **50+ steps** (and not waiting for a red light), the episode **terminates immediately** with a **-50.0** penalty.
+        - **Anti-Camping**: Forces the agent to drive to survive.
+      - **"Flow or Fail" Reward v2**:
+        - **Cost of Living**: **-0.1** per step constant penalty.
+        - **Conditional Rewards**: 
+          - **Safe**: +1.0 * Speed (Reward for moving).
+          - **Blocked (Red Light)**: +1.0 * (1-Speed) (Reward for stopping).
+        - **Steering Stability**: Penalty for rapid steering changes to prevent wobbling.
+      - **Periodic Traffic Lights**: Implemented at fixed waypoints (Indices 100, 300).
+      - **Dynamic Physics**: Lidar range and braking efficiency are affected by `temperature`.
+      - **Observation Space**: 107-dimensional vector including:
+        - **Lookahead CTE**: Uses a point 10m ahead for smoother steering control.
+        - **Lidar**: 8 Rays with dynamic range.
+        - **Traffic Light**: State & Distance.
 
 ### 2. UrbanCausalIntersection-v0
 The original complex environment with a 4-way intersection.
-- **Features**: Full traffic light cycles, turning lanes, and complex right-of-way rules.
-- **Continuous Actions**: Fine-grained steering and acceleration control.
 
 ## Installation
 
@@ -35,43 +38,44 @@ pip install -e .
 ## Quick Start
 
 ### Interactive Demo
-Manually control the car to get a feel for the physics and rules.
-
-**Simple Environment (Recommended):**
 ```bash
 python demo_simple_env.py
 ```
-**Controls (WASD):**
-- `W`: Accelerate
-- `S`: Brake
-- `A`: Steer Left
-- `D`: Steer Right
 
-**Visualization Features:**
-- **UI Overlay**: Top-left stats (Episode, Step, Reward).
-- **Environment Info**: Top-right stats (Light State, Dist, Temp).
-- **Visuals**: 
-    - **Lidar Rays**: Yellow (clear) / Red (blocked), length changes with temperature.
-    - **Lane Center**: Cyan line indicating the ideal path.
-    - **Traffic Light**: Colored circle indicating current state.
+### Environments & Physics (Arcade Edition)
+Recently updated with "Arcade-ified" physics for better RL training:
+- **Buffed Controls**: Sharper steering (0.2), stronger brakes (2.0), and higher friction (0.8).
+- **Pedestrian Horror**:
+  - **Negative Lidar**: Pedestrians appear as negative values in Lidar to distinguish them from cars.
+  - **Pre-Crash Fear**: Penalty (-1.0) for getting too close to pedestrians at high speed.
+  - **Panic Brake**: Action 5 triggers a -1.0 full braking force.
 
 ### Training Agents
-We provide scripts to train **PPO** and **DQN** agents on the `SimpleCausalIntersection-v0` environment.
+We provide scripts to train **PPO**, **DQN**, and **Dueling DQN** agents.
 
-**DQN (Best Performance - Tuned):**
+**1. Dueling DQN (Recommended for Stability):**
+```bash
+python train_dueling_dqn.py
+```
+- **Features**: Gradient Clipping (1.0), Dueling Architecture, Custom Logging.
+
+**2. Standard DQN (Refined):**
 ```bash
 python train_dqn_viz.py
 ```
 - **Configuration**:
-    - **Hyperparameters**: LR `1e-4`, Buffer `200k`, Exploration `30%`, Batch `128`.
-    - **Success Threshold**: Training automatically stops if Episode Reward > **800.0** (Approx. 40-50s of driving).
-    - **Output**: Saves plots and videos to `videos_dqn_curved/`.
+    - **Linear Schedule**: LR decays from 1e-4 to 0.0.
+    - **Exploration**: Decays from 1.0 to 0.01 over 40% of training.
+    - **Gradient Clipping**: Enabled (1.0).
 
-**PPO:**
+**3. PPO (Refined):**
 ```bash
 python train_viz.py
 ```
-- **Note**: PPO currently struggles with this specific discrete/randomized setup compared to DQN.
+- **Configuration**:
+    - **Linear Schedule**: LR decays from 3e-4 to 0.0.
+    - **Entropy**: Fixed at 0.0 to prevent jitter.
+    - **Clip Range**: 0.2.
 
 ## Causal Discovery
 The project includes a pipeline to generate data and discover the underlying causal graph using the **FCI (Fast Causal Inference)** algorithm.

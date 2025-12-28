@@ -86,9 +86,10 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         self._agent_heading = None
         
         # Physics constants
-        self.max_speed = 8.0
-        self.acceleration = 0.5
-        self.angular_velocity = 0.10
+        self.max_speed = 9.0 # Buffed from 8.0
+        self.acceleration = 0.8 # Buffed from 0.5
+        self.brake_deceleration = 2.0 # Strong braking
+        self.angular_velocity = 0.25 # Buffed from 0.10
         self.car_length = 25
         self.car_width = 12
         self.safety_buffer = float(self.car_width + 20)
@@ -481,14 +482,21 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         """Simple LIDAR: distance to nearest pedestrian or car along ray directions."""
         angles = self._agent_heading + np.linspace(-np.pi, np.pi, num_rays, endpoint=False)
         dists = np.full(num_rays, max_range, dtype=np.float32)
+        
+        # Store obstacles with type: (pos, rad, type_id) 1=Car, 2=Ped
         obstacles = []
         for car in self.npc_cars:
-            obstacles.append((car["pos"], self.car_width / 2))
+            obstacles.append((car["pos"], self.car_width / 2, 1))
         for ped in self.pedestrians:
-            obstacles.append((ped["pos"], self.pedestrian_radius))
+            obstacles.append((ped["pos"], self.pedestrian_radius, 2))
+            
         agent_pos = self._agent_location
         for i, ang in enumerate(angles):
             ray_dir = np.array([np.cos(ang), -np.sin(ang)], dtype=np.float32)
+            
+            # Track nearest object type for this ray
+            nearest_type = 0 
+            
             # Sample along the ray
             for r in np.linspace(5, max_range, num=25):
                 p = agent_pos + ray_dir * r
@@ -496,13 +504,23 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                 if p[0] < 0 or p[0] > self.map_size or p[1] < 0 or p[1] > self.map_size:
                     dists[i] = min(dists[i], r)
                     break
-                # obstacles
-                for (op, rad) in obstacles:
+                
+                radius_hit = False
+                for (op, rad, otype) in obstacles:
                     if np.linalg.norm(p - op) <= rad + 2:
-                        dists[i] = min(dists[i], r)
+                        if r < dists[i]:
+                            dists[i] = r
+                            nearest_type = otype
+                        radius_hit = True
                         break
-                if dists[i] < r:
+                
+                if radius_hit:
                     break
+            
+            # If nearest was Ped, flip sign
+            if nearest_type == 2:
+                dists[i] = -dists[i]
+                
         return dists.tolist()
 
     def _nearest_cars_features(self, k: int = 5):
@@ -1691,7 +1709,8 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             # Roughness 0.0 (-10C) -> 40% braking power
             # Roughness 1.0 (30C) -> 100% braking power
             braking_efficiency = 0.4 + (0.6 * self.context.get("roughness", 1.0))
-            accel = self.acceleration * accel_cmd * braking_efficiency
+            # USE NEW BRAKE DECELERATION
+            accel = self.brake_deceleration * accel_cmd * braking_efficiency
             
             self._agent_velocity[0] += accel * np.cos(self._agent_heading)
             self._agent_velocity[1] += accel * -np.sin(self._agent_heading)
@@ -1769,6 +1788,16 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                                      ped["pos"], self.pedestrian_radius):
                 collision_with_pedestrian = True
                 break
+        
+        # --- PRE-CRASH FEAR (Pedestrian Horror) ---
+        min_ped_dist = float('inf')
+        for ped in self.pedestrians:
+            d = np.linalg.norm(self._agent_location - ped["pos"])
+            if d < min_ped_dist: min_ped_dist = d
+            
+        current_spd = np.linalg.norm(self._agent_velocity)
+        if min_ped_dist < 5.0 and current_spd > 2.0:
+            reward -= 1.0
         
         # --- Reward Structure (Standardized) ---
         # 1. Time penalty (encourage efficiency)

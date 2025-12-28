@@ -173,10 +173,17 @@ class VizCallback(BaseCallback):
                 # Save plot periodically (every 10 episodes)
                 if self.episode_count % 10 == 0:
                      plt.figure(figsize=(10, 5))
-                     plt.plot(self.all_rewards)
+                     plt.plot(self.all_rewards, alpha=0.3, label='Raw')
+                     # Rolling Mean
+                     window = 50
+                     if len(self.all_rewards) >= window:
+                         ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
+                         plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
+                         
                      plt.title("PPO Episode Rewards (Curved Road)")
                      plt.xlabel("Episode")
                      plt.ylabel("Reward")
+                     plt.legend()
                      plt.grid(True)
                      plt.savefig("reward_plot_ppo_curved.png")
                      plt.close()
@@ -192,18 +199,16 @@ class VizCallback(BaseCallback):
 
     # ... (Wrappers and imports remain similar)
     
-def linear_schedule(initial_value: float):
+from typing import Callable
+
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
     """
     Linear learning rate schedule.
-    :param initial_value: Initial learning rate.
-    :return: schedule function check
+    :param initial_value: The initial learning rate.
+    :return: schedule that computes current learning rate depending on remaining progress
     """
     def func(progress_remaining: float) -> float:
-        """
-        Progress will decrease from 1 (beginning) to 0.
-        :param progress_remaining:
-        :return: current learning rate
-        """
+        # progress_remaining decreases from 1.0 (start) to 0.0 (end)
         return progress_remaining * initial_value
     return func
 
@@ -223,7 +228,6 @@ def main():
     env = Monitor(env) # Tracks stats for SB3
     
     # 3. Add Video Recorder
-    # 3. Add Video Recorder
     # Trigger: Record every 30th episode
     video_folder = 'videos_ppo_curved'
     def video_trigger(episode_id):
@@ -237,17 +241,32 @@ def main():
     )
     
     # 4. Initialize Agent
-    # Use linear decay schedule
-    lr_schedule = linear_schedule(3e-4) # Start at 3e-4
-    model = PPO("MlpPolicy", env, verbose=0, learning_rate=lr_schedule)
+    # Use linear decay schedule (3e-4 -> 0.0)
+    # New schedule takes ONE arg (initial_value)
+    lr_schedule = linear_schedule(3e-4)
+    
+    model = PPO(
+        "MlpPolicy", 
+        env, 
+        verbose=1, 
+        learning_rate=lr_schedule,
+        ent_coef=0.0, # Force entropy to 0.0 (User Request)
+        clip_range=0.2, # Explicitly set clip range
+        max_grad_norm=0.5, # Keep PPO clip at 0.5
+        batch_size=64,
+        n_steps=2048,
+        gamma=0.99
+    )
     
     print("Starting PPO training (Curved Road)...")
     print(f"Videos will be saved to ./{video_folder} every 30 episodes")
     print("Visualization window will appear every 100 episodes.")
     
     # 5. Train
-    steps = 300000 
+    steps = 600000 # Increased Duration
     viz_callback = VizCallback(viz_freq=100)
+    
+    # Pass only viz_callback (Entropy is fixed 0.0)
     model.learn(total_timesteps=steps, callback=viz_callback)
     
     # 6. Save
@@ -261,10 +280,18 @@ def main():
         print(f"Final Reward: {final_reward}")
         
         plt.figure(figsize=(10, 5))
-        plt.plot(rewards)
+        plt.plot(rewards, alpha=0.3, label='Raw')
+        
+        # Rolling Mean
+        window = 50
+        if len(rewards) >= window:
+            ma = np.convolve(rewards, np.ones(window)/window, mode='valid')
+            plt.plot(range(window-1, len(rewards)), ma, color='red', label=f'{window}-Ep Avg')
+            
         plt.title("PPO Episode Rewards (Curved Road)")
         plt.xlabel("Episode")
         plt.ylabel("Reward")
+        plt.legend()
         plt.grid(True)
         plt.savefig("reward_plot_ppo_curved.png")
         print("Reward plot saved to reward_plot_ppo_curved.png")

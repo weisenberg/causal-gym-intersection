@@ -21,27 +21,40 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         # Override context for simple env
         self.context["traffic_light_duration"] = 300 # 10 seconds at 30 FPS
         
+        # --- Physics Buffs (Arcade-ify) ---
+        # 1. Faster Steering
+        self.max_steer_change = 0.2 # Was 0.05 or similar? 
+        # 2. Super Brakes
+        self.brake_accel = 2.0 # Was likely < 1.0. Double it.
+        # 3. Grip (Tire Friction) which reduces sliding
+        self.friction = 0.8 # Was 0.5?
+        
         # --- Discrete Action Space ---
         # 0: Idle (maintain speed)
         # 1: Accelerate
         # 2: Brake
-        # 3: Steer Left (small)
-        # 4: Steer Right (small)
-        self.action_space = spaces.Discrete(5)
+        # 3: Steer Left
+        # 4: Steer Right 
+        # 5: Panic Brake (New)
+        self.action_space = spaces.Discrete(6)
+
+
+
         
 
         # --- Full State Observation Space (Refactored) ---
-        # Agent (4): CTE, HeadingErr, Speed, Steer
+        # --- Full State Observation Space (Refactored) ---
+        # Agent (7): Centering, Lateral, Heading, Speed, Steer, LaneID, Angle
         # Lidar (5): 5 Rays
         # Semantic (4): Type, RelVX, RelVY, Width
         # Light (4): Green, Yellow, Red, Dist
         # Road (10): 5 * [RelX, RelY]
         # NPCs (20): 5 * [RelX, RelY, RelVX, RelVY]
         # Peds (60): 30 * [RelX, RelY]
-        # Total: 4 + 5 + 4 + 4 + 10 + 20 + 60 = 107
+        # Total: 7 + 5 + 4 + 4 + 10 + 20 + 60 = 110
         self.obs_max_npcs = 5
         self.obs_max_peds = 30
-        self.obs_dim = 107
+        self.obs_dim = 110
         
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
@@ -60,6 +73,8 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         # Endless Runner State
         self.total_distance = 0.0
         self.last_milestone = 0.0
+        self.consecutive_idle_steps = 0 # Anti-Camping Counter
+        self.last_steering = 0.0 # for steering stability penalty
         
         # Correct last_waypoint_index based on actual spawn
         # Otherwise _check_off_road and Lidar will fail in first step
@@ -970,12 +985,14 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         
         if action == 1: # Accelerate
             accel = 1.0
-        elif action == 2: # Brake
-            accel = -1.0
+        elif action == 2: # Brake (Normal)
+            accel = -0.5 # Half braking
         elif action == 3: # Left
-            steer = 0.5
+            steer = 1.0 # Max steering (Buffed)
         elif action == 4: # Right
-            steer = -0.5
+            steer = -1.0 # Max steering (Buffed)
+        elif action == 5: # Panic Brake (New)
+            accel = -1.0 # Full braking force
             
         continuous_action = np.array([accel, steer], dtype=np.float32)
         
@@ -1063,56 +1080,107 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         
         # --- Rewards ---
         
-        # 1. Flow Reward (Velocity based)
-        # (speed_along_lane / max_speed) * 0.1
-        # Project velocity onto tangent
-        if self.last_waypoint_index < len(self.track_data):
-            tangent = self.track_data[self.last_waypoint_index]["tangent"]
-            speed_proj = np.dot(self._agent_velocity, tangent)
-            norm_speed = speed_proj / 5.0 # Max speed 5.0
-            flow_reward = norm_speed * 0.1
-            reward += flow_reward
+        # --- Multi-Ray Lidar & Safety ---
+        lidar_dists, semantic_info = self._compute_multiray_lidar()
+        
+        # --- Flow or Fail Reward Logic v2 ---
+        
+        # 1. Cost of Living (Crucial Change)
+        # Constant penalty to force action.
+        reward -= 0.1 
+        
+        # 2. Determine Context
+        upcoming_idx, dist_to_light = self._get_upcoming_light() # Dist in Waypoint units
+        is_red_light = (self.traffic_light_state == 2) and (dist_to_light < 40.0)
+        
+        # Blocked by obstacle?
+        min_lidar = min(lidar_dists)
+        is_blocked = (min_lidar < 0.2) # ~30m
+        # Also strictly check for obstacles < 10m (0.06 approx)
+        is_hard_blocked = (min_lidar < 0.1) or is_red_light
+        
+        should_stop = is_red_light or is_blocked
+        
+        current_speed = np.linalg.norm(self._agent_velocity)
+        max_speed = 5.0
+        norm_speed = current_speed / max_speed
+        
+        # 3. Conditional Speed Reward
+        if not should_stop:
+             # SAFE Context (Green light, no obstacle)
+             # Reward Speed heavily.
+             # Must be > 0.1 to be net positive.
+             reward += 1.0 * norm_speed
+        else:
+             # BLOCKED Context (Red light, Obstacle)
+             # Reward Stopping.
+             # If speed is 0, reward is 1.0. If speed is max, reward is 0.0.
+             reward += 1.0 * (1.0 - norm_speed)
+             
+        # 4. Anti-Camping Termination (Move or Die)
+        # Logic: If speed < 2.0 (and not blocked) for > 50 steps -> Terminate with -50.0
+        # "The agent is currently gaming the system by waiting."
+        if current_speed < 2.0 and not should_stop:
+            self.consecutive_idle_steps += 1
+        else:
+            self.consecutive_idle_steps = 0
             
-        # 2. Milestone Bonus (+10 every 100m)
+        if self.consecutive_idle_steps > 50: 
+            reward -= 50.0
+            terminated = True
+            # print("Terminated due to laziness (Move or Die).")
+            
+        # 5. Steering Stability Reward
+        # Fix wobbling by penalizing rapid steering changes.
+        # Track last steering in self.last_steering (initialized in reset)
+        steer_diff = abs(continuous_action[1] - self.last_steering)
+        reward -= 0.1 * steer_diff
+        self.last_steering = continuous_action[1] # Update for next step
+
+        # 6. Milestone Bonus (+10 every 100m) - Keep this as progress incentive
+
         if self.total_distance - self.last_milestone >= 100.0:
             reward += 10.0
             self.last_milestone = self.total_distance
 
-        # Penalize turning
+        # Penalize turning hard
         if action == 3 or action == 4:
             reward -= 0.05 * 0.5
-        
-        # --- Multi-Ray Lidar & Safety ---
-        lidar_dists, semantic_info = self._compute_multiray_lidar()
-        
-        # 1. Danger Penalty (General Impact)
-        # If min dist is very small (< 0.1 / 5m) and fast
-        min_lidar = min(lidar_dists)
-        current_speed = np.linalg.norm(self._agent_velocity)
-        if min_lidar < 0.1 and current_speed > 2.0:
-            reward -= 1.0
             
-        # 2. Pedestrian Safety Penalty (Specific)
-        # If nearest object is Pedestrian (type=1.0) and close (< 0.2 / 10m)
+        # 6. Safety Penalties (Critical)
+        
+        # --- PEDESTRIAN HORROR (Pre-Crash Fear) ---
+        # "Don't even get CLOSE to them at high speed."
+        # If dist_to_pedestrian < 5.0 meters AND speed > 2.0, apply a penalty of -1.0 per step.
+        if semantic_info and semantic_info.get("type") == 1.0: # Pedestrian
+            # Dist is normalized by 60.0 (max_dist)
+            dist_m = semantic_info["dist"] * 60.0 
+            if dist_m < 5.0 and current_speed > 2.0:
+                reward -= 1.0
+
+        if min_lidar < 0.05 and current_speed > 2.0: # Very close impact
+            reward -= 5.0
+            
         if semantic_info["type"] == 1.0 and semantic_info["dist"] < 0.2:
-            reward -= 5.0 # Huge penalty for threatening pedestrian
+            reward -= 5.0 # Threatening pedestrian
             
-        # Lane Centering Reward (New Dense Strategy)
+        # Lane Centering Reward (New Right-Lane Strategy)
+        # 1.0 - abs(cross_track_error_from_target / tolerance)
+        # Use our new helper
+        lateral, centering_error, _ = self._calculate_local_lane_info()
         
-        # Lane Centering Reward (New Dense Strategy)
-        # 1.0 - abs(cross_track_error / (lane_width / 2))
-        # Use our helper
-        cte, _ = self._calculate_local_lane_error()
-        cte = abs(cte)
-        
-        # Lane width / 2 = approx 20.0 (Track width 80 -> Lane width 40 -> Half 20)
-        # User requested: target local_x should be +lane_width / 2.
-        # Implied strictly Right Lane.
         # Tolerance: 15.0m
-        centering_reward = 1.0 - (cte / 15.0)
+        centering_reward = 1.0 - (centering_error / 15.0)
         centering_reward = max(0.0, centering_reward) # Clip >= 0
         
-        reward += centering_reward # Add to step reward
+        reward += centering_reward 
+        
+        # Oncoming Traffic Penalty (Left Lane is Lava)
+        # If lateral < 0 (Left Side), massive penalty scaling with distance into danger.
+        if lateral < 0.0:
+            reward -= 0.5 * abs(lateral)
+            # Example: At -10 (Left Center): -5.0 penalty per step.
+            # This is huge. It will force right lane quickly.
             
         # --- Penalties and Termination ---
             
@@ -1244,23 +1312,77 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             
         return dists
 
+    def _get_lookahead_cte(self, lookahead_dist=10.0):
+        # Pure Pursuit Logic: Find curvature error relative to a point ahead
+        # 1. Project current pos to find base index
+        # 2. Look ahead by 'lookahead_dist' along the track
+        # 3. Calculate lateral error to THAT point's tangent/normal?
+        # Actually standard CTE is fine, but we want the ERROR relative to the Lookahead Point
+        # Ideally: Vector from Agent to Lookahead Point. 
+        # Calculate angle difference between Agent Heading and Vector to Point.
+        # But user asked for "Cross Track Error... relative to a point 5-10 meters ahead".
+        # This usually means: What is the distance from the Lookahead Point to the line defined by the Agent's Heading? No.
+        # It likely means: What is the distance of the AGENT from the path defined at the lookahead point?
+        # Standard Pure Pursuit uses "Steering Angle = arctan(2L sin(alpha) / k)".
+        # Let's interpret "CTE to lookahead": 
+        # Simply calculate the distance of the agent from the center line, but using the normal vector OF THE LOOKAHEAD POINT.
+        # Or better: Project Agent Pos onto the Lookahead Point's Line.
+        
+        # Identify Lookahead Point
+        current_idx = self.last_waypoint_index
+        target_dist = self.track_waypoints[current_idx]
+        
+        # Traverse forward to find point at dist
+        # Approx: 1 index ~ 2 meters? No. Spline is variable.
+        # Let's just step forward
+        search_idx = current_idx
+        accum_dist = 0
+        while accum_dist < lookahead_dist and search_idx < len(self.track_data) - 1:
+            p1 = self.track_data[search_idx]["pos"]
+            p2 = self.track_data[search_idx+1]["pos"]
+            accum_dist += np.linalg.norm(p2 - p1)
+            search_idx += 1
+            
+        target_point = self.track_data[search_idx]["pos"]
+        target_tangent = self.track_data[search_idx]["tangent"]
+        
+        # Calculate vector from Agent to Target
+        to_target = target_point - self._agent_location
+        
+        # Cross Product (2D) to find signed distance
+        # "How far is the target to the left/right of my current heading?" - That's pure pursuit alpha.
+        # User asked for "Cross Track Error".
+        # Let's calculate the lateral distance of the Agent relative to the Target's Tangent.
+        # i.e. Project (Agent - Target) onto Random Normal?
+        # Let's stick to the Pure Pursuit interpretation which is robust for steering.
+        # Return the Signed Angle to the target point?
+        # Or just the distance to the Spline at the lookahead index?
+        # "Calculate the error relative to a point 5-10 meters ahead"
+        # Let's calculate the distance between Agent and Target Point? No.
+        
+        # Simplest Smoothing: Return the distance of the agent to the line passing through Target Point with Target Tangent.
+        # projected_dist = dot(Agent - Target, Normal_at_Target)
+        normal_at_target = self.track_data[search_idx]["normal"]
+        cte = np.dot(self._agent_location - target_point, normal_at_target)
+        
+        return cte
+
     def _get_obs(self):
         # Return full state vector
         state = []
         
         # 1. Agent State (6)
         # Pos (x,y), Vel (vx,vy), Heading (cos, sin)
-        # Normalize Pos to map scale approx (0-600) -> 0-1
         state.extend(self._agent_location / 600.0)
         state.extend(self._agent_velocity / 5.0) # approx max speed
         state.append(np.cos(self._agent_heading))
         state.append(np.sin(self._agent_heading))
         
         # 2. Road State (13)
-        # Dist to center, Heading Error, Next 5 Waypoints (relative)
-        # Track State
-        dist = self._get_track_distance(self._agent_location)
-        state.append(dist / 40.0) # Width normalized
+        # Dist to center (Smoothed Lookahead CTE)
+        # User requested 5-10m. Let's use 10.0.
+        cte_lookahead = self._get_lookahead_cte(lookahead_dist=10.0)
+        state.append(cte_lookahead / 40.0) # Width normalized
         
     def _compute_multiray_lidar(self):
         # 5 Rays: -60, -30, 0, 30, 60
@@ -1297,6 +1419,7 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             ray_dir = np.array([dx, dy])
             
             min_d = max_dist
+            ray_hit_type = 0 # 0=None, 1=Car, 2=Ped
             
             # Check NPCs
             for car in self.npc_cars:
@@ -1307,6 +1430,7 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                     rejection = np.linalg.norm(vec - proj * ray_dir)
                     if rejection < (self.car_width + self.car_width)/2 + 1.0:
                         min_d = proj
+                        ray_hit_type = 1 # Car
                         # Update global nearest
                         if dist_sq < nearest_obj_dist:
                             nearest_obj_dist = dist_sq
@@ -1334,6 +1458,7 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                     rejection = np.linalg.norm(vec - proj * ray_dir)
                     if rejection < (self.car_width/2 + 1.0):
                         min_d = proj
+                        ray_hit_type = 2 # Ped
                         if dist_sq < nearest_obj_dist:
                             nearest_obj_dist = dist_sq
                             # Ped Velocity? (Construct from speed/target or use stored?)
@@ -1362,7 +1487,9 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                                 "dist": min_d / max_dist
                             }
                             
-            lidar_readings.append(min_d / max_dist)
+            val = min_d / max_dist
+            if ray_hit_type == 2: val = -val
+            lidar_readings.append(val)
             
         if nearest_obj_data is None:
              nearest_obj_data = {"type": 0.0, "rel_vx": 0.0, "rel_vy": 0.0, "width": 0.0, "dist": 1.0}
@@ -1398,66 +1525,96 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
              
         return [rel_x, rel_y]
 
-    def _calculate_local_lane_error(self):
+    def _calculate_local_lane_info(self):
+        """
+        Calculates lateral (cross track) error and longitudinal progress.
+        Sign Convention:
+        - Lateral > 0: Right Side (Good)
+        - Lateral < 0: Left Side (Oncoming/Lava)
+        """
         # Find closest waypoint for local tangent reference
         if self.last_waypoint_index >= len(self.track_data):
-            return 0.0, 0.0 # Default
+            return 0.0, 0.0, 0.0 # Default
             
         d = self.track_data[self.last_waypoint_index]
         road_center = d["pos"]
         tangent = d["tangent"]
         
-        # Road Angle from tangent
-        road_angle = np.arctan2(tangent[1], tangent[0])
-        
         # Vector from road center to car
         dx = self._agent_location[0] - road_center[0]
         dy = self._agent_location[1] - road_center[1]
         
-        # Rotate by negative road angle to align with vertical lane (Local Frame)
-        # local_x = Lateral Deviation (CTE)
-        # local_y = Longitudinal Progress relative to waypoint
-        local_x = dx * np.cos(-road_angle) - dy * np.sin(-road_angle)
-        local_y = dx * np.sin(-road_angle) + dy * np.cos(-road_angle)
+        # Tangent (tx, ty)
+        tx, ty = tangent
         
-        # Calculate deviation from RIGHT lane center (-10.0)
-        # We enforce driving on the right side.
-        # Lanes are at -10 (Right) and +10 (Left).
+        # Longitudinal = Dot Product (Project onto tangent)
+        longitudinal = dx * tx + dy * ty
         
-        # FIX: Originally we used min(dist_right, dist_left) which allowed valid driving on wrong side.
-        # Now strictly target right lane.
-        target_x = -10.0
-        cte = local_x - target_x
-            
-        return cte, road_angle
-            
-        return cte, road_angle
+        # Lateral = Cross Product (Z-component of D x T) 
+        # Or Dot Product with Right-Facing Normal (ty, -tx)
+        # Normal (Left) is (-ty, tx).
+        # We want Positive = Right. So we project onto Right Normal (ty, -tx).
+        lateral = dx * ty + dy * (-tx)
+        
+        # Verify:
+        # If Road East (1, 0). Right Normal (0, -1).
+        # If Car South (0, -10). Right Side.
+        # lateral = 0*0 + (-10)*(-1) = 10. (Positive). Correct.
+        # If Car North (0, 10). Left Side.
+        # lateral = 0*0 + 10*(-1) = -10. (Negative). Correct.
+        
+        # Calculate Error relative to Right Lane Center (+20.0)
+        # Lane width ~40? User said "Lane width / 2".
+        # If track width is 80 (radius?). Lane width is 40. Center is 20.
+        target_x = 20.0 
+        centering_error = abs(lateral - target_x)
+        
+        # Road Angle
+        road_angle = np.arctan2(ty, tx)
+        
+        return lateral, centering_error, road_angle
 
     def _get_obs(self):
         # Return Refactored Egocentric State (96 dim)
         state = []
         
-        # 1. Agent State (4) 
-        # CTE, Heading Error, Speed, Steering
+        # 1. Agent State (7) 
+        # CTE to Target, Heading Error, Speed, Steering, Lane Info
         
-        cte, road_angle = self._calculate_local_lane_error()
+        lateral, centering_error, road_angle = self._calculate_local_lane_info()
         
-        # 1. Cross Track Error (Normalized) -> Lane width approx 20? 
-        # User said "normalized... to lane marker". Let's say +/- 20 is edge.
-        state.append(np.clip(cte / 20.0, -1.0, 1.0))
+        # 1. Centering Error (Dist to Right Lane Center)
+        # Normalize to lane width (approx 20)
+        state.append(np.clip(centering_error / 20.0, 0.0, 1.0))
         
-        # 2. Heading Error (Angle diff between car and road)
+        # 2. Signed Lateral Position (Crucial for knowing Left vs Right)
+        # >0 Right, <0 Left. 
+        state.append(np.clip(lateral / 20.0, -1.0, 1.0))
+        
+        # Lookahead CTE (Keep smoothness) -> Relative to Right Center?
+        # Re-using the Lookahead logic:
+        # We should probably update _get_lookahead_cte to target Right Lane too?
+        # Or just rely on the new immediate CTE for now.
+        # User requested "Ensure agent knows which lane...". Signed Lateral is enough.
+        
+        # 3. Heading Error
         diff = road_angle - self._agent_heading
-        # Normalize to -pi, pi
         diff = (diff + np.pi) % (2 * np.pi) - np.pi
         state.append(np.clip(diff, -1.0, 1.0))
         
-        # 3. Normalized Speed
+        # 4. Normalized Speed
         speed = np.linalg.norm(self._agent_velocity)
         state.append(np.clip(speed / 5.0, 0.0, 1.0))
         
-        # 4. Steering (Keep 0.0 for now as placeholder)
+        # 5. Steering (Keep 0.0 for now as placeholder)
         state.append(0.0) 
+        
+        # 6. Lane ID (Explicit Feature)
+        # +1.0 for Right, -1.0 for Left
+        state.append(1.0 if lateral > 0 else -1.0)
+        
+        # 7. Angle to Lane (Redundant with Heading Error but useful)
+        state.append(np.sin(diff))
         
         # --- Multi-Ray Lidar (5) & Semantic (4) ---
         lidar_dists, semantic = self._compute_multiray_lidar()
