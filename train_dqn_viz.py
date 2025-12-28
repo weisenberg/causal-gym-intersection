@@ -15,6 +15,26 @@ pygame.font.init()
 
 # Ensure env is registered
 import gym_causal_intersection
+import shutil
+from datetime import datetime
+
+def archive_old_runs(agent_type="dqn"):
+    targets = {
+        "ppo": ["videos_ppo_curved", "reward_plot_ppo_curved.png", "ppo_causal_agent_curved.zip"],
+        "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_causal_agent_curved.zip", "dqn_replay_buffer_curved.pkl"]
+    }
+    
+    found = [f for f in targets[agent_type] if os.path.exists(f)]
+    if not found: return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join("run_archive", "{}_{}".format(agent_type, ts))
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    print("Archiving to {}...".format(archive_dir))
+    for f in found:
+        try: shutil.move(f, os.path.join(archive_dir, f))
+        except Exception as e: print("Error archiving {}: {}".format(f, e))
 
 class OverlayWrapper(gym.Wrapper):
     """
@@ -158,6 +178,14 @@ class VizCallback(BaseCallback):
                      plt.grid(True)
                      plt.savefig("reward_plot_dqn_curved.png")
                      plt.close()
+                
+                # Success Threshold Check (User Req: ~50s driving)
+                # Est: 1500 steps * ~0.6 reward/step = 900.
+                # Threshold: 800.0
+                if r > 800.0:
+                    print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
+                    return False # Stop training
+                    
             self.episode_count += 1
             
         return True
@@ -178,6 +206,9 @@ def linear_schedule(initial_value: float):
     return func
 
 def main():
+    # Archive first!
+    archive_old_runs("dqn")
+
     # 1. Create Environment
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
     
@@ -199,18 +230,38 @@ def main():
     )
     
     # 4. Initialize Agent
-    # Use linear decay schedule
-    lr_schedule = linear_schedule(1e-4) # Start at 1e-4 for DQN
-    model = DQN("MlpPolicy", env, verbose=0, learning_rate=lr_schedule, buffer_size=50000, exploration_fraction=0.2)
+    # Create the agent
+    model = DQN(
+        "MlpPolicy",
+        env,
+        learning_rate=linear_schedule(1e-4), # Lower LR
+        buffer_size=200000, # Larger buffer
+        learning_starts=5000, # More warmup
+        batch_size=128, # Larger batch
+        tau=0.05, # Soft update
+        gamma=0.98,
+        train_freq=4,
+        gradient_steps=1,
+        target_update_interval=5000, # More stable target
+        exploration_fraction=0.3, # More exploration (30%)
+        exploration_final_eps=0.02,
+        verbose=1
+    )
+    
+    # Callback
+    viz_callback = VizCallback(viz_freq=100)
+    
+    # Train
+    # User requested threshold ~40-50s driving.
+    # At 30 FPS = 1500 steps.
+    # If reward ~0.5 per step (speed dependent), total ~750.
+    # Let's target 750.0 reward or just train longer.
     
     print("Starting DQN training (Curved Road)...")
-    print(f"Videos will be saved to ./{video_folder} every 30 episodes")
+    print("Videos will be saved to ./videos_dqn_curved every 30 episodes")
     print("Visualization window will appear every 100 episodes.")
     
-    # 5. Train
-    steps = 300000 
-    viz_callback = VizCallback(viz_freq=100)
-    model.learn(total_timesteps=steps, callback=viz_callback)
+    model.learn(total_timesteps=600000, callback=viz_callback) # Increased timesteps
     
     # 6. Save
     model.save("dqn_simple_causal_curved")

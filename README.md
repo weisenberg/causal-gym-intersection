@@ -4,15 +4,22 @@ A Gymnasium environment for simulating urban traffic scenarios, designed for **C
 
 ## Environments
 
-### 1. SimpleCausalIntersection-v0 (New & Recommended)
-A simplified, "infinite" vertical road environment designed for faster training and clear causal analysis.
-- **Goal**: Drive as far north/south as possible without crashing.
+### 1. SimpleCausalIntersection-v0 (Curved Road Edition)
+A procedural "infinite" spline-based road environment designed for robust driving and causal reasoning.
+- **Goal**: Drive as far as possible along the curved lane without crashing or violating traffic rules.
 - **Features**:
-  - **Infinite Road**: The road extends indefinitely (visually loops/extends), allowing for long-distance driving.
-  - **Randomized Layout**: At each reset, the road's rotation and position are randomized, forcing the agent to generalize rather than memorize coordinates.
-  - **Randomized Spawn**: Agent spawns with a random heading offset ($\pm 28^\circ$), requiring immediate steering correction.
-  - **Discrete Actions**: Simplified action space (Idle, Accelerate, Brake, Left, Right).
-  - **Spurious Correlations**: Visual features like NPC car color and size can be randomized to test agent robustness against non-causal factors.
+  - **Procedural Spline Road**: The road is generated using splines, creating challenging curves instead of a straight line.
+  - **Infinite Runner**: When the agent reaches the end, it is teleported back to the start (preserving momentum) for continuous training.
+  - **Periodic Traffic Lights**: Implemented at fixed waypoints (Indices 100, 300).
+    - **State Machine**: Cycles through Green -> Yellow -> Red.
+    - **Penalties**: Running a Red Light results in a severe penalty (-50.0) and immediate episode termination.
+    - **Pedestrian Sync**: Pedestrians only attempt to cross the road when the traffic light is Red for vehicles.
+  - **Dynamic Physics**: Lidar range and braking efficiency are affected by the environment's `temperature` (Causal Confounder).
+  - **Observation Space**: 107-dimensional vector including:
+    - Agent State (Vel, Heading, CTE)
+    - **Lidar**: 8 Rays with dynamic range (visualized in Yellow/Red).
+    - **Traffic Light**: One-hot encoding (Green/Yellow/Red) + Distance to next light.
+    - Nearby Entities (NPCs, Pedestrians).
 
 ### 2. UrbanCausalIntersection-v0
 The original complex environment with a 4-way intersection.
@@ -40,15 +47,25 @@ python demo_simple_env.py
 - `A`: Steer Left
 - `D`: Steer Right
 
+**Visualization Features:**
+- **UI Overlay**: Top-left stats (Episode, Step, Reward).
+- **Environment Info**: Top-right stats (Light State, Dist, Temp).
+- **Visuals**: 
+    - **Lidar Rays**: Yellow (clear) / Red (blocked), length changes with temperature.
+    - **Lane Center**: Cyan line indicating the ideal path.
+    - **Traffic Light**: Colored circle indicating current state.
+
 ### Training Agents
 We provide scripts to train **PPO** and **DQN** agents on the `SimpleCausalIntersection-v0` environment.
 
-**DQN (Best Performance):**
+**DQN (Best Performance - Tuned):**
 ```bash
 python train_dqn_viz.py
 ```
-- **Results**: Converges to consistent success (reaching the goal) even with randomized layouts and starting headings.
-- **Output**: Saves plots and videos to `videos_dqn_random/`.
+- **Configuration**:
+    - **Hyperparameters**: LR `1e-4`, Buffer `200k`, Exploration `30%`, Batch `128`.
+    - **Success Threshold**: Training automatically stops if Episode Reward > **800.0** (Approx. 40-50s of driving).
+    - **Output**: Saves plots and videos to `videos_dqn_curved/`.
 
 **PPO:**
 ```bash
@@ -57,43 +74,35 @@ python train_viz.py
 - **Note**: PPO currently struggles with this specific discrete/randomized setup compared to DQN.
 
 ## Causal Discovery
-The project includes a pipeline to generate data and discover the underlying causal graph of the environment using the **FCI (Fast Causal Inference)** algorithm.
+The project includes a pipeline to generate data and discover the underlying causal graph using the **FCI (Fast Causal Inference)** algorithm.
 
 1.  **Generate Data**:
-    Run the agent (random or trained) to collect interaction data.
     ```bash
     python generate_simple_data.py
     ```
     - Generates `simple_env_data.csv` (default: 1,000,000 steps).
 
 2.  **Run FCI Algorithm**:
-    Analyze the data to reconstruct the causal graph.
     ```bash
     python run_fci_optimized.py
     ```
     - **Output**: `causal_graph_fci_optimized.png`
-    - **Outcome**: Successfully recovers the true causal links (e.g., `Traffic Light -> Agent Speed`, `Brake -> Velocity`) while correctly identifying confounders.
+    - **Outcome**: Successfully recovers true causal links (e.g., `Traffic Light -> Agent Speed`).
 
 ## Key Features for Research
 
-### Domain Randomization
-The environment supports extensive randomization to prevent overfitting and test generalization:
+### Domain Randomization & Causal Variables
 - **Layout**: Rotation and center position of the road.
-- **Spawn Conditions**: Initial position and heading.
 - **Visuals**: NPC car colors (red, blue, rainbow) and sizes.
-- **Physics**: Friction and braking efficiency based on "Temperature".
-
-### Causal Variables
-The environment exposes ground-truth causal variables in the `info` dictionary, allowing for direct verification of causal discovery algorithms.
-- `temperature`: Affects physics (friction).
-- `traffic_density`: Affects NPC count.
-- `driver_impatience`: Affects NPC acceleration/behavior.
+- **Physics**: 
+    - `temperature`: Affects friction and Lidar range (simulating visibility/braking conds).
+    - `traffic_density`: Affects NPC count.
+    - `driver_impatience`: Affects NPC acceleration.
 
 ## File Structure
-- `gym_causal_intersection/envs/`: Environment source code.
-  - `simple_causal_env.py`: The infinite vertical road env.
-  - `causal_intersection_env.py`: Base class and 4-way intersection env.
-- `train_dqn_viz.py`: Main DQN training script.
+- `gym_causal_intersection/envs/`: Source code.
+  - `simple_causal_env.py`: The curved road env with traffic lights.
+- `train_dqn_viz.py`: Main DQN training script (Tuned).
 - `train_viz.py`: Main PPO training script.
 - `demo_simple_env.py`: Manual control demo.
 - `generate_simple_data.py`: Causal data generation.

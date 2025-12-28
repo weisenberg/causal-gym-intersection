@@ -15,6 +15,26 @@ pygame.font.init()
 
 # Ensure env is registered
 import gym_causal_intersection
+import shutil
+from datetime import datetime
+
+def archive_old_runs(agent_type="ppo"):
+    targets = {
+        "ppo": ["videos_ppo_curved", "reward_plot_ppo_curved.png", "ppo_causal_agent_curved.zip"],
+        "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_causal_agent_curved.zip", "dqn_replay_buffer_curved.pkl"]
+    }
+    
+    found = [f for f in targets[agent_type] if os.path.exists(f)]
+    if not found: return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join("run_archive", f"{agent_type}_{ts}")
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    print(f"Archiving to {archive_dir}...")
+    for f in found:
+        try: shutil.move(f, os.path.join(archive_dir, f))
+        except Exception as e: print(f"Error archiving {f}: {e}")
 
 class OverlayWrapper(gym.Wrapper):
     """
@@ -160,6 +180,12 @@ class VizCallback(BaseCallback):
                      plt.grid(True)
                      plt.savefig("reward_plot_ppo_curved.png")
                      plt.close()
+                
+                # Success Threshold (Match DQN)
+                if r > 800.0:
+                    print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
+                    return False
+                    
             self.episode_count += 1
             
         return True
@@ -183,6 +209,9 @@ def linear_schedule(initial_value: float):
 
 def main():
     import os
+    # Archive first!
+    archive_old_runs("ppo")
+    
     print(f"DEBUG: CWD = {os.getcwd()}")
     print(f"DEBUG: Video folder absolute path = {os.path.abspath('videos_ppo_curved')}")
     
