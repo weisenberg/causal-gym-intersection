@@ -67,6 +67,7 @@ python train_dqn_viz.py
     - **Linear Schedule**: LR decays from 1e-4 to 0.0.
     - **Exploration**: Decays from 1.0 to 0.01 over 40% of training.
     - **Gradient Clipping**: Enabled (1.0).
+    - **Safety Shield**: Force-overrides actions if `TTC < 1.5s`.
 
 **3. PPO (Refined):**
 ```bash
@@ -76,6 +77,11 @@ python train_viz.py
     - **Linear Schedule**: LR decays from 3e-4 to 0.0.
     - **Entropy**: Fixed at 0.0 to prevent jitter.
     - **Clip Range**: 0.2.
+    - **Convergence**: Stops automatically if no improvement for 100k steps.
+
+### Safety Features
+- **Hardcoded Safety Shield**: A `SafetyWrapper` intercepts actions. If collision is imminent (TTC < 1.5s), it forces a **Panic Brake** (-1.0), overriding the agent's choice.
+- **Save Best Model**: Scripts use `EvalCallback` to save the best model to `./logs/best_model_dqn/`.
 
 ## Causal Discovery
 The project includes a pipeline to generate data and discover the underlying causal graph using the **FCI (Fast Causal Inference)** algorithm.

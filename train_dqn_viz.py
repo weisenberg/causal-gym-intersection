@@ -189,9 +189,13 @@ class VizCallback(BaseCallback):
                 # Success Threshold Check (User Req: ~50s driving)
                 # Est: 1500 steps * ~0.6 reward/step = 900.
                 # Threshold: 800.0
-                if r > 800.0:
-                    print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
-                    return False # Stop training
+                # Success Threshold Check (User Req: ~50s driving)
+                # Est: 1500 steps * ~0.6 reward/step = 900.
+                # Threshold: 800.0
+                # removed per user request for max potential
+                # if r > 800.0:
+                #     print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
+                #     return False # Stop training
                     
             self.episode_count += 1
             
@@ -218,6 +222,9 @@ def main():
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
     
     # 2. Add Wrappers
+    from gym_causal_intersection.wrappers.safety_wrapper import SafetyWrapper
+    env = SafetyWrapper(env) # Hardcoded Safety Shield
+    
     env = OverlayWrapper(env) # Adds text to render()
     env = Monitor(env) # Tracks stats for SB3
     
@@ -259,20 +266,35 @@ def main():
         verbose=1
     )
     
-    # Callback
-    viz_callback = VizCallback(viz_freq=100)
+    # Callbacks
+    viz_callback = VizCallback(viz_freq=30)
     
-    # Train
-    # User requested threshold ~40-50s driving.
-    # At 30 FPS = 1500 steps.
-    # If reward ~0.5 per step (speed dependent), total ~750.
-    # Let's target 750.0 reward or just train longer.
+    # Eval Callback (Best Model)
+    from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+    
+    # Save best model to ./logs/best_model
+    # Check every 10,000 steps
+    stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=10, min_evals=5, verbose=1)
+    
+    eval_callback = EvalCallback(
+        env,
+        best_model_save_path='./logs/best_model_dqn',
+        log_path='./logs/results_dqn',
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+        callback_after_eval=stop_train_callback
+    )
+    
+    # Chain callbacks
+    callbacks = [viz_callback, eval_callback]
     
     print("Starting DQN training (Curved Road)...")
     print("Videos will be saved to ./videos_dqn_curved every 30 episodes")
-    print("Visualization window will appear every 100 episodes.")
+    print("Best model will be saved to ./logs/best_model_dqn")
     
-    model.learn(total_timesteps=600000, callback=viz_callback) # Increased timesteps
+    # Increased total steps to allow convergence
+    model.learn(total_timesteps=600000, callback=callbacks)
     
     # 6. Save
     model.save("dqn_simple_causal_curved")

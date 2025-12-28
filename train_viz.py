@@ -189,9 +189,11 @@ class VizCallback(BaseCallback):
                      plt.close()
                 
                 # Success Threshold (Match DQN)
-                if r > 800.0:
-                    print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
-                    return False
+                # Success Threshold (Match DQN)
+                # Removed per user request to allow max convergence
+                # if r > 800.0:
+                #    print(f"Goal Reached! Reward {r:.2f} > 800.0. Stopping Training.")
+                #    return False
                     
             self.episode_count += 1
             
@@ -224,6 +226,9 @@ def main():
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
     
     # 2. Add Wrappers
+    from gym_causal_intersection.wrappers.safety_wrapper import SafetyWrapper
+    env = SafetyWrapper(env) # Hardcoded Safety Shield
+    
     env = OverlayWrapper(env) # Adds text to render()
     env = Monitor(env) # Tracks stats for SB3
     
@@ -264,10 +269,29 @@ def main():
     
     # 5. Train
     steps = 600000 # Increased Duration
-    viz_callback = VizCallback(viz_freq=100)
+    # Callbacks
+    viz_callback = VizCallback(viz_freq=30)
+    
+    # Eval Callback (Best Model)
+    from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+    
+    # Save best model to ./logs/best_model_ppo
+    stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=10, min_evals=5, verbose=1)
+    
+    eval_callback = EvalCallback(
+        env,
+        best_model_save_path='./logs/best_model_ppo',
+        log_path='./logs/results_ppo',
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+        callback_after_eval=stop_train_callback
+    )
+    
+    callbacks = [viz_callback, eval_callback]
     
     # Pass only viz_callback (Entropy is fixed 0.0)
-    model.learn(total_timesteps=steps, callback=viz_callback)
+    model.learn(total_timesteps=steps, callback=callbacks)
     
     # 6. Save
     model.save("ppo_simple_causal_curved")

@@ -22,8 +22,11 @@ def test_env(env_id):
         traceback.print_exc()
 
 if __name__ == "__main__":
-    # Test Base
-    test_env('UrbanCausalIntersection-v0')
-    # Test Extended
-    test_env('UrbanCausalIntersectionExtended-v0')
+    envs_to_test = [
+        "SimpleCausalIntersection-v0",
+        "UrbanCausalIntersection-v0",
+        "UrbanCausalIntersectionExtended-v0"
+    ]
+    for env_id in envs_to_test:
+        test_env(env_id)
     print("Verification Done.")
