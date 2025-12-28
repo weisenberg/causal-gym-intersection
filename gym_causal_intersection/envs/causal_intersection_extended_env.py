@@ -67,11 +67,11 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                 dtype=np.uint8
             )
         else:
-            # kinematic (55 dims): 5 agent + 16 lidar + 20 cars + 10 peds + 4 light
+            # kinematic (48 dims): 5 agent + 9 lidar (non-linear) + 20 cars + 10 peds + 4 light
             self.observation_space = spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(55,),
+                shape=(48,),
                 dtype=np.float32
             )
         
@@ -421,6 +421,29 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         # Reset pedestrians
         self.pedestrians = []
         
+        # -----------------------------------------------
+        # Safe Spawn Logic (Delayed to after agent placement?)
+        # Agent is placed at self._agent_location BEFORE this?
+        # No, agent logic is inherited or set earlier?
+        # Let's check reset flow. 
+        # ExtendedEnv.reset calls super().reset? No, it re-implements it usually?
+        # Lines 313: def reset(self, ...):
+        # ...
+        # self._generate_layout(randomize=True)
+        # ... (spawns agent)
+        # self.npc_cars = []
+        # self.pedestrians = []
+        # ... (spawns NPCs/Peds?)
+        # Wait, ExtendedEnv spawns them in step?
+        # Or initialized empty?
+        # Line 1765: self._spawn_npc_car() in step
+        # Line 421: self.pedestrians = []
+        # It seems ExtendedEnv starts EMPTY and spawns dynamically?
+        # If so, the overlap check is only needed in _spawn functions.
+        # I already added it to _spawn_npc_car.
+        # I need to check _spawn_pedestrian.
+        # -----------------------------------------------
+        
         # Reset traffic lights
         for key in self.traffic_lights:
             self.traffic_lights[key]["timer"] = 0
@@ -468,7 +491,7 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             float(self._agent_heading),
         ])
         # LIDAR (16 rays)
-        obs_parts.extend(self._compute_lidar(num_rays=16, max_range=200.0))
+        obs_parts.extend(self._compute_lidar(num_rays=9, max_range=200.0))
         # Nearest 5 cars (relative pos/vel: 4 each -> 20)
         obs_parts.extend(self._nearest_cars_features(k=5))
         # Nearest 5 pedestrians (relative pos: 2 each -> 10)
@@ -478,10 +501,13 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         obs_parts.extend([red, yellow, green, ttc])
         return np.array(obs_parts, dtype=np.float32)
 
-    def _compute_lidar(self, num_rays: int = 16, max_range: float = 200.0):
+    def _compute_lidar(self, num_rays: int = 9, max_range: float = 200.0):
         """Simple LIDAR: distance to nearest pedestrian or car along ray directions."""
-        angles = self._agent_heading + np.linspace(-np.pi, np.pi, num_rays, endpoint=False)
-        dists = np.full(num_rays, max_range, dtype=np.float32)
+        # 9 Rays: [-60, -35, -20, -10, 0, 10, 20, 35, 60]
+        # Ignore num_rays arg to enforce non-linear distribution
+        angle_offsets = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
+        angles = self._agent_heading + angle_offsets
+        dists = np.full(len(angles), max_range, dtype=np.float32)
         
         # Store obstacles with type: (pos, rad, type_id) 1=Car, 2=Ped
         obstacles = []
@@ -722,6 +748,10 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
             "color": color
         }
         
+        if self._agent_location is not None:
+             if np.linalg.norm(npc_car["pos"] - self._agent_location) < 50.0:
+                 return # Skip spawn (Safe Spawn)
+
         self.npc_cars.append(npc_car)
 
     def _update_npc_cars(self):
@@ -1397,6 +1427,9 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                     target[0] = road_x - self.road_width // 2 - 10
                 # Keep y the same (cross perpendicular)
             
+            if self._agent_location is not None and np.linalg.norm(spawn_pos - self._agent_location) < 25.0:
+                return # Skip spawn (Safe Spawn)
+
             pedestrian = {
                 "pos": spawn_pos.astype(np.float32),
                 "target": target.astype(np.float32),
@@ -1840,8 +1873,36 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
                         break
             
             if valid_exit:
-                reward = 100.0  # Success (Valid Exit)
+                # ENDLESS LOOPING: Wrap around map
+                # Wrap to opposite side.
+                lx, ly = self._agent_location
+                wrap_buffer = 10.0
+                if lx < 0: lx = self.map_size + wrap_buffer
+                elif lx > self.map_size: lx = 0 - wrap_buffer
+                
+                if ly < 0: ly = self.map_size + wrap_buffer
+                elif ly > self.map_size: ly = 0 - wrap_buffer
+                
+                self._agent_location = np.array([lx, ly], dtype=np.float32)
+                
+                # --- Safe Reset: Clear Area at Wrap ---
+                valid_npcs = []
+                for car in self.npc_cars:
+                    if np.linalg.norm(car["pos"] - self._agent_location) > 50.0:
+                        valid_npcs.append(car)
+                self.npc_cars = valid_npcs
+                
+                valid_peds = []
+                for ped in self.pedestrians:
+                    if np.linalg.norm(ped["pos"] - self._agent_location) > 25.0:
+                         valid_peds.append(ped)
+                self.pedestrians = valid_peds
+                
+                # Small bonus for "lapping" or continuing
+                reward += 10.0 
+                terminated = False # Do NOT terminate
             else:
+                terminated = True
                 reward = -10.0 # Off-Road Exit
             
         observation = self._get_obs()
@@ -2067,6 +2128,49 @@ class UrbanCausalIntersectionExtendedEnv(gym.Env):
         front_offset = np.array([self.car_length / 2 * cos_h, -self.car_length / 2 * sin_h])
         front_pos = agent_pos + front_offset
         pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
+
+        # --- Draw Lidar Rays ---
+        angle_offsets = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
+        angles = self._agent_heading + angle_offsets
+        max_dist = 200.0
+        
+        obstacles = []
+        for car in self.npc_cars:
+            obstacles.append((car["pos"], self.car_width / 2))
+        for ped in self.pedestrians:
+            obstacles.append((ped["pos"], self.pedestrian_radius))
+            
+        for ang in angles:
+            # Standard trig for World Coords (which match Canvas coords)
+            ray_dir = np.array([np.cos(ang), np.sin(ang)])
+            start_p = self._agent_location
+            end_p = start_p + ray_dir * max_dist
+            
+            # Check collisions
+            actual_dist = max_dist
+            for (op, rad) in obstacles:
+                vec = op - start_p
+                proj = np.dot(vec, ray_dir)
+                if proj > 0 and proj < actual_dist:
+                    dist_to_line = np.linalg.norm(vec - proj * ray_dir)
+                    if dist_to_line < rad:
+                        actual_dist = proj
+            
+            end_p = start_p + ray_dir * actual_dist
+            
+            # Color
+            color = (0, 255, 0)
+            if actual_dist < max_dist * 0.2: color = (255, 0, 0)
+            elif actual_dist < max_dist * 0.5: color = (255, 165, 0)
+            
+            # Draw
+            pygame.draw.line(canvas, color, start_p.astype(int), end_p.astype(int), 1)
+            pygame.draw.circle(canvas, color, end_p.astype(int), 2)
+            
+        # --- Draw "Line on Road" (Target Heading) ---
+        heading_dir = np.array([np.cos(self._agent_heading), np.sin(self._agent_heading)])
+        target_line_end = self._agent_location + heading_dir * 100.0
+        pygame.draw.line(canvas, (255, 255, 255), self._agent_location.astype(int), target_line_end.astype(int), 1)
         
         if self.render_mode == "human":
             # Draw only the visible portion (centered on agent)

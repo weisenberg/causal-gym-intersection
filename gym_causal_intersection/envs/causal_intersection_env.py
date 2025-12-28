@@ -50,9 +50,9 @@ class UrbanCausalIntersectionEnv(gym.Env):
                 low=0, high=255, shape=(84, 84, 3), dtype=np.uint8
             )
         else:
-            # 55-dim (now includes nearest cars since we add simple NPC traffic)
+            # 48-dim: 5 agent + 9 lidar (non-linear) + 20 cars + 10 peds + 4 light
             self.observation_space = spaces.Box(
-                low=-np.inf, high=np.inf, shape=(55,), dtype=np.float32
+                low=-np.inf, high=np.inf, shape=(48,), dtype=np.float32
             )
         
         # Actions: continuous [acceleration, steering] in [-1, 1]
@@ -235,7 +235,25 @@ class UrbanCausalIntersectionEnv(gym.Env):
         # Spawn Pedestrians
         for _ in range(self.context.get("num_pedestrians", 5)):
              self._spawn_pedestrian()
-             
+
+        # --- Safe Spawn (Prevent Agent-NPC Overlap) ---
+        # Remove any NPC that is too close to the agent
+        safe_distance = 25.0
+        valid_npcs = []
+        for car in self.npc_cars:
+            d = np.linalg.norm(car["pos"] - self._agent_location)
+            if d > safe_distance:
+                valid_npcs.append(car)
+        self.npc_cars = valid_npcs
+        
+        # --- Safe Spawn: Check Pedestrians ---
+        valid_peds = []
+        for ped in self.pedestrians:
+             d = np.linalg.norm(ped["pos"] - self._agent_location)
+             if d > safe_distance:
+                 valid_peds.append(ped)
+        self.pedestrians = valid_peds
+              
         # Reset time and intersection tracking
         self.step_count = 0
         self.intersections_crossed = set()
@@ -448,16 +466,19 @@ class UrbanCausalIntersectionEnv(gym.Env):
             float(self._agent_velocity[1]),
             float(self._agent_heading),
         ])
-        obs.extend(self._compute_lidar(num_rays=16, max_range=200.0))
+        obs.extend(self._compute_lidar(num_rays=9, max_range=200.0))
         obs.extend(self._nearest_cars_features(k=5))
         obs.extend(self._nearest_ped_features(k=5))
         r, y, g, ttc = self._next_traffic_light_features()
         obs.extend([r, y, g, ttc])
         return np.array(obs, dtype=np.float32)
 
-    def _compute_lidar(self, num_rays: int = 16, max_range: float = 200.0):
-        angles = self._agent_heading + np.linspace(-np.pi, np.pi, num_rays, endpoint=False)
-        dists = np.full(num_rays, max_range, dtype=np.float32)
+    def _compute_lidar(self, num_rays: int = 9, max_range: float = 200.0):
+        # 9 Rays: [-60, -35, -20, -10, 0, 10, 20, 35, 60]
+        # Ignore num_rays arg to enforce non-linear distribution
+        angle_offsets = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
+        angles = self._agent_heading + angle_offsets
+        dists = np.full(len(angles), max_range, dtype=np.float32)
         
         # Store obstacles with type: (pos, rad, type_id) 1=Car, 2=Ped
         obstacles = []
@@ -1111,10 +1132,39 @@ class UrbanCausalIntersectionEnv(gym.Env):
             terminated = True
             reward = -100.0
         elif off_screen:
-            terminated = True
             if valid_exit:
-                reward = 100.0
+                # ENDLESS LOOPING: Wrap around map
+                # Map size is 600. Valid exit means we are in a lane.
+                # Wrap to opposite side.
+                lx, ly = self._agent_location
+                wrap_buffer = 10.0
+                if lx < 0: lx = 600 + wrap_buffer
+                elif lx > 600: lx = 0 - wrap_buffer
+                
+                if ly < 0: ly = 600 + wrap_buffer
+                elif ly > 600: ly = 0 - wrap_buffer
+                
+                self._agent_location = np.array([lx, ly], dtype=np.float32)
+                
+                # --- Safe Reset: Clear Area at Wrap ---
+                # Remove NPCs/Peds at new location (rare but possible)
+                valid_npcs = []
+                for car in self.npc_cars:
+                    if np.linalg.norm(car["pos"] - self._agent_location) > 25.0:
+                        valid_npcs.append(car)
+                self.npc_cars = valid_npcs
+                
+                valid_peds = []
+                for ped in self.pedestrians:
+                    if np.linalg.norm(ped["pos"] - self._agent_location) > 25.0:
+                         valid_peds.append(ped)
+                self.pedestrians = valid_peds
+                
+                # Small bonus for "lapping" or continuing
+                reward += 10.0 
+                # Do NOT terminate
             else:
+                terminated = True
                 reward = -10.0 # Off-road exit
         
         # Terminations and success
@@ -1357,6 +1407,83 @@ class UrbanCausalIntersectionEnv(gym.Env):
         front_offset = np.array([self.car_length / 2 * cos_h, -self.car_length / 2 * sin_h])
         front_pos = agent_pos + front_offset
         pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
+
+        # --- Draw Lidar Rays ---
+        # 9 Rays: [-60, -35, -20, -10, 0, 10, 20, 35, 60]
+        # In pygame y-down: angle = heading + offset. 
+        # But heading 0 is right. y is DOWN. 
+        # sin(theta) gives UP on normal cartesian, DOWN in pygame.
+        # So we just use standard trig and it maps correctly to screen space (0=Right, 90=Down).
+        angle_offsets = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
+        angles = self._agent_heading + angle_offsets
+        
+        # Recalculate range for visual scale (approx 200m)
+        max_dist = 200.0
+        
+        # Simple Raycast for Viz
+        obstacles = []
+        for car in self.npc_cars:
+            obstacles.append((car["pos"], self.car_width / 2))
+        for ped in self.pedestrians:
+            obstacles.append((ped["pos"], self.pedestrian_radius))
+            
+        for ang in angles:
+            ray_dir = np.array([np.cos(ang), np.sin(ang)]) # y is normal here for screen coords?
+            # heading in Env: 0=East, +angle=North? 
+            # Env physics: y is standard (Up). Pygame: y is Down.
+            # to_screen maps world pos to screen pos.
+            # But here we are calculating offsets in WORLD space then adding to agent_pos?
+            # Wait, previously we used manual calculation.
+            # Let's rely on standard vector addition in World Space, then cast to int?
+            # The agent drawing above used rotation matrix.
+            # Let's simplify: Draw lines from start to end in SCREEN space.
+            # We assume World Space coords.
+            
+            # NOTE: render frame uses manual transformation? 
+            # No, 'to_screen' is not defined in this file's _render_frame!
+            # It draws directly using self._agent_location?
+            # self.window_size is 600. Map is 600x600.
+            # Yes, direct mapping. 
+            # BUT env y is UP? Or DOWN?
+            # In reset: spawn car.
+            # Let's check "corners" calculation above:
+            # rotation_matrix = [[cos, sin], [-sin, cos]]
+            # This implies standard rotation.
+            
+            ray_dir = np.array([np.cos(ang), np.sin(ang)])
+            start_p = self._agent_location
+            end_p = start_p + ray_dir * max_dist
+            
+            # Check collisions
+            actual_dist = max_dist
+            for (op, rad) in obstacles:
+                # Simple line-circle intersection approx
+                vec = op - start_p
+                proj = np.dot(vec, ray_dir)
+                if proj > 0 and proj < actual_dist:
+                    dist_to_line = np.linalg.norm(vec - proj * ray_dir)
+                    if dist_to_line < rad:
+                        actual_dist = proj
+            
+            end_p = start_p + ray_dir * actual_dist
+            
+            # Color
+            color = (0, 255, 0)
+            if actual_dist < max_dist * 0.2: color = (255, 0, 0)
+            elif actual_dist < max_dist * 0.5: color = (255, 165, 0)
+            
+            # Draw
+            # Must invert Y if env is y-up? 
+            # No, the drawing code above uses direct subtraction/addition.
+            # Assuming env coords match screen coords (y-down) or consistent system.
+            pygame.draw.line(canvas, color, start_p.astype(int), end_p.astype(int), 1)
+            pygame.draw.circle(canvas, color, end_p.astype(int), 2)
+            
+        # --- Draw "Line on Road" (Target Heading) ---
+        # Just a faint white line indicating straight ahead
+        heading_dir = np.array([np.cos(self._agent_heading), np.sin(self._agent_heading)])
+        target_line_end = self._agent_location + heading_dir * 100.0
+        pygame.draw.line(canvas, (255, 255, 255), self._agent_location.astype(int), target_line_end.astype(int), 1)
 
         # Render info overlay
         if pygame.font:

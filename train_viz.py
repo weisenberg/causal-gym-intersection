@@ -19,16 +19,17 @@ import shutil
 from datetime import datetime
 
 def archive_old_runs(agent_type="ppo"):
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
     targets = {
-        "ppo": ["videos_ppo_curved", "reward_plot_ppo_curved.png", "ppo_causal_agent_curved.zip"],
-        "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_causal_agent_curved.zip", "dqn_replay_buffer_curved.pkl"]
+        "ppo": ["videos_ppo_curved", "reward_plot_ppo_curved.png", "ppo_simple_causal_curved.zip"],
+        "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_simple_causal_curved.zip", "dqn_replay_buffer_curved.pkl"]
     }
     
     found = [f for f in targets[agent_type] if os.path.exists(f)]
     if not found: return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_dir = os.path.join("run_archive", f"{agent_type}_{ts}")
+    archive_dir = os.path.join(log_root, "run_archive", f"{agent_type}_{ts}")
     os.makedirs(archive_dir, exist_ok=True)
     
     print(f"Archiving to {archive_dir}...")
@@ -135,9 +136,11 @@ class OverlayWrapper(gym.Wrapper):
         return np.array(image)
 
 class VizCallback(BaseCallback):
-    def __init__(self, viz_freq=100):
+    def __init__(self, viz_freq=100, save_path=".", plot_name="reward_plot_ppo_curved.png"):
         super().__init__()
         self.viz_freq = viz_freq
+        self.save_path = save_path
+        self.plot_name = plot_name
         self.episode_count = 0
         self.fig, self.ax = None, None
         self.all_rewards = []
@@ -175,17 +178,18 @@ class VizCallback(BaseCallback):
                      plt.figure(figsize=(10, 5))
                      plt.plot(self.all_rewards, alpha=0.3, label='Raw')
                      # Rolling Mean
-                     window = 50
-                     if len(self.all_rewards) >= window:
-                         ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
-                         plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
+                     if len(self.all_rewards) > 0:
+                         window = min(50, len(self.all_rewards))
+                         if window > 1:
+                             ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
+                             plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
                          
                      plt.title("PPO Episode Rewards (Curved Road)")
                      plt.xlabel("Episode")
                      plt.ylabel("Reward")
                      plt.legend()
                      plt.grid(True)
-                     plt.savefig("reward_plot_ppo_curved.png")
+                     plt.savefig(os.path.join(self.save_path, self.plot_name))
                      plt.close()
                 
                 # Success Threshold (Match DQN)
@@ -219,8 +223,14 @@ def main():
     # Archive first!
     archive_old_runs("ppo")
     
-    print(f"DEBUG: CWD = {os.getcwd()}")
-    print(f"DEBUG: Video folder absolute path = {os.path.abspath('videos_ppo_curved')}")
+    # Define Log Directory
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"ppo_viz_{timestamp}"
+    run_dir = os.path.join(log_root, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    print(f"Training run directory: {run_dir}")
     
     # 1. Create Environment
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
@@ -230,11 +240,11 @@ def main():
     env = SafetyWrapper(env) # Hardcoded Safety Shield
     
     env = OverlayWrapper(env) # Adds text to render()
-    env = Monitor(env) # Tracks stats for SB3
+    env = Monitor(env, filename=os.path.join(run_dir, "monitor")) # Tracks stats for SB3
     
     # 3. Add Video Recorder
     # Trigger: Record every 30th episode
-    video_folder = 'videos_ppo_curved'
+    video_folder = os.path.join(run_dir, 'videos_ppo_curved')
     def video_trigger(episode_id):
         return episode_id % 30 == 0
         
@@ -260,42 +270,45 @@ def main():
         max_grad_norm=0.5, # Keep PPO clip at 0.5
         batch_size=64,
         n_steps=2048,
-        gamma=0.99
+        gamma=0.99,
+        tensorboard_log=os.path.join(run_dir, "tensorboard")
     )
     
     print("Starting PPO training (Curved Road)...")
-    print(f"Videos will be saved to ./{video_folder} every 30 episodes")
+    print(f"Videos will be saved to {video_folder} every 30 episodes")
     print("Visualization window will appear every 100 episodes.")
     
     # 5. Train
     steps = 600000 # Increased Duration
     # Callbacks
-    viz_callback = VizCallback(viz_freq=30)
+    viz_callback = VizCallback(viz_freq=30, save_path=run_dir, plot_name="reward_plot.png")
     
     # Eval Callback (Best Model)
-    from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+    from stable_baselines3.common.callbacks import EvalCallback
     
     # Save best model to ./logs/best_model_ppo
-    stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=10, min_evals=5, verbose=1)
+    # Note: We create a fresh eval env to avoid issues
+    eval_env = gym.make('SimpleCausalIntersection-v0', render_mode=None)
+    eval_env = Monitor(eval_env)
     
     eval_callback = EvalCallback(
-        env,
-        best_model_save_path='./logs/best_model_ppo',
-        log_path='./logs/results_ppo',
+        eval_env,
+        best_model_save_path=os.path.join(run_dir, 'best_model_ppo'),
+        log_path=os.path.join(run_dir, 'results_ppo'),
         eval_freq=10000,
         deterministic=True,
-        render=False,
-        callback_after_eval=stop_train_callback
+        render=False
     )
     
+    # Removed StopTrainingOnRewardThreshold
     callbacks = [viz_callback, eval_callback]
     
     # Pass only viz_callback (Entropy is fixed 0.0)
     model.learn(total_timesteps=steps, callback=callbacks)
     
     # 6. Save
-    model.save("ppo_simple_causal_curved")
-    print("Model saved to ppo_simple_causal_curved.zip")
+    model.save(os.path.join(run_dir, "ppo_simple_causal_curved"))
+    print(f"Model saved to {os.path.join(run_dir, 'ppo_simple_causal_curved.zip')}")
     
     # 7. Plot Rewards
     rewards = viz_callback.all_rewards
@@ -317,8 +330,8 @@ def main():
         plt.ylabel("Reward")
         plt.legend()
         plt.grid(True)
-        plt.savefig("reward_plot_ppo_curved.png")
-        print("Reward plot saved to reward_plot_ppo_curved.png")
+        plt.savefig(os.path.join(run_dir, "reward_plot_ppo_curved.png"))
+        print(f"Reward plot saved to {os.path.join(run_dir, 'reward_plot_ppo_curved.png')}")
     
     env.close()
     if plt.get_fignums():

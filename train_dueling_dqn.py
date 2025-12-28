@@ -133,6 +133,7 @@ class DuelingDQNPolicy(DQNPolicy):
 # --- HELPERS (Same as DQN Script) ---
 
 def archive_old_runs(agent_type="dueling_dqn"):
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
     targets = {
         "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_simple_causal_curved.zip"], # Legacy
         "dueling_dqn": ["videos_dueling_dqn", "reward_plot_dueling_dqn.png", "dueling_dqn_causal.zip"]
@@ -144,7 +145,7 @@ def archive_old_runs(agent_type="dueling_dqn"):
     if not found: return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_dir = os.path.join("run_archive", "{}_{}".format(agent_type, ts))
+    archive_dir = os.path.join(log_root, "run_archive", "{}_{}".format(agent_type, ts))
     os.makedirs(archive_dir, exist_ok=True)
     
     print("Archiving to {}...".format(archive_dir))
@@ -240,9 +241,11 @@ class OverlayWrapper(gym.Wrapper):
         return np.array(image)
 
 class VizCallback(BaseCallback):
-    def __init__(self, viz_freq=100):
+    def __init__(self, viz_freq=100, save_path=".", plot_name="reward_plot_dueling_dqn.png"):
         super().__init__()
         self.viz_freq = viz_freq
+        self.save_path = save_path
+        self.plot_name = plot_name
         self.episode_count = 0
         self.all_rewards = []
     
@@ -259,18 +262,20 @@ class VizCallback(BaseCallback):
                 if self.episode_count % 10 == 0:
                      plt.figure(figsize=(10, 5))
                      plt.plot(self.all_rewards, alpha=0.3, label='Raw')
+                     plt.plot(self.all_rewards, alpha=0.3, label='Raw')
                      # Rolling Mean
-                     window = 50
-                     if len(self.all_rewards) >= window:
-                         ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
-                         plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
+                     if len(self.all_rewards) > 0:
+                         window = min(50, len(self.all_rewards))
+                         if window > 1:
+                             ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
+                             plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
                          
                      plt.title("Dueling DQN Rewards")
                      plt.xlabel("Episode")
                      plt.ylabel("Reward")
                      plt.legend()
                      plt.grid(True)
-                     plt.savefig("reward_plot_dueling_dqn.png")
+                     plt.savefig(os.path.join(self.save_path, self.plot_name))
                      plt.close()
                 
                 # Success Threshold
@@ -291,13 +296,22 @@ def main():
     # Archive first
     archive_old_runs("dueling_dqn")
 
+    # Define Log Directory
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"dueling_dqn_{timestamp}"
+    run_dir = os.path.join(log_root, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    print(f"Training run directory: {run_dir}")
+
     # 1. Create Environment
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
     env = OverlayWrapper(env)
-    env = Monitor(env) 
+    env = Monitor(env, filename=os.path.join(run_dir, "monitor")) 
     
     # 2. Add Video Recorder
-    video_folder = 'videos_dueling_dqn'
+    video_folder = os.path.join(run_dir, 'videos')
     def video_trigger(episode_id):
         return episode_id % 30 == 0
         
@@ -326,17 +340,18 @@ def main():
         exploration_final_eps=0.05,
         max_grad_norm=1.0, # Enable Gradient Clipping
         verbose=1,
+        tensorboard_log=os.path.join(run_dir, "tensorboard"),
         policy_kwargs={"net_arch": [256, 256]} # Passed to our Custom Policy
     )
     
     print("Starting Dueling DQN training...")
-    print(f"Videos: ./{video_folder}")
+    print(f"Videos: {video_folder}")
     
-    viz_callback = VizCallback(viz_freq=100)
+    viz_callback = VizCallback(viz_freq=100, save_path=run_dir, plot_name="reward_plot.png")
     model.learn(total_timesteps=600000, callback=viz_callback)
     
-    model.save("dueling_dqn_causal")
-    print("Model saved to dueling_dqn_causal.zip")
+    model.save(os.path.join(run_dir, "dueling_dqn_causal"))
+    print(f"Model saved to {os.path.join(run_dir, 'dueling_dqn_causal.zip')}")
     
     # Final Plot
     rewards = viz_callback.all_rewards
@@ -352,7 +367,7 @@ def main():
         plt.ylabel("Reward")
         plt.legend()
         plt.grid(True)
-        plt.savefig("reward_plot_dueling_dqn.png")
+        plt.savefig(os.path.join(run_dir, "reward_plot_final.png"))
     
     env.close()
 

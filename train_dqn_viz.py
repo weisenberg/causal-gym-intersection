@@ -19,6 +19,7 @@ import shutil
 from datetime import datetime
 
 def archive_old_runs(agent_type="dqn"):
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
     targets = {
         "ppo": ["videos_ppo_curved", "reward_plot_ppo_curved.png", "ppo_causal_agent_curved.zip"],
         "dqn": ["videos_dqn_curved", "reward_plot_dqn_curved.png", "dqn_causal_agent_curved.zip", "dqn_replay_buffer_curved.pkl"]
@@ -28,13 +29,13 @@ def archive_old_runs(agent_type="dqn"):
     if not found: return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_dir = os.path.join("run_archive", "{}_{}".format(agent_type, ts))
+    archive_dir = os.path.join(log_root, "run_archive", f"{agent_type}_{ts}")
     os.makedirs(archive_dir, exist_ok=True)
     
-    print("Archiving to {}...".format(archive_dir))
+    print(f"Archiving to {archive_dir}...")
     for f in found:
         try: shutil.move(f, os.path.join(archive_dir, f))
-        except Exception as e: print("Error archiving {}: {}".format(f, e))
+        except Exception as e: print(f"Error archiving {f}: {e}")
 
 class OverlayWrapper(gym.Wrapper):
     """
@@ -135,9 +136,11 @@ class OverlayWrapper(gym.Wrapper):
         return np.array(image)
 
 class VizCallback(BaseCallback):
-    def __init__(self, viz_freq=100):
+    def __init__(self, viz_freq=100, save_path=".", plot_name="reward_plot_dqn_curved.png"):
         super().__init__()
         self.viz_freq = viz_freq
+        self.save_path = save_path
+        self.plot_name = plot_name
         self.episode_count = 0
         self.fig, self.ax = None, None
         self.all_rewards = []
@@ -173,17 +176,18 @@ class VizCallback(BaseCallback):
                      plt.figure(figsize=(10, 5))
                      plt.plot(self.all_rewards, alpha=0.3, label='Raw')
                      # Rolling Mean
-                     window = 50
-                     if len(self.all_rewards) >= window:
-                         ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
-                         plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
+                     if len(self.all_rewards) > 0:
+                         window = min(50, len(self.all_rewards))
+                         if window > 1:
+                             ma = np.convolve(self.all_rewards, np.ones(window)/window, mode='valid')
+                             plt.plot(range(window-1, len(self.all_rewards)), ma, color='red', label=f'{window}-Ep Avg')
                          
                      plt.title("DQN Episode Rewards (Curved Road)")
                      plt.xlabel("Episode")
                      plt.ylabel("Reward")
                      plt.legend()
                      plt.grid(True)
-                     plt.savefig("reward_plot_dqn_curved.png")
+                     plt.savefig(os.path.join(self.save_path, self.plot_name))
                      plt.close()
                 
                 # Success Threshold Check (User Req: ~50s driving)
@@ -218,6 +222,15 @@ def main():
     # Archive first!
     archive_old_runs("dqn")
 
+    # Define Log Directory
+    log_root = "/Users/ali/Desktop/masterarbeit/playground/logs"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"dqn_viz_{timestamp}"
+    run_dir = os.path.join(log_root, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    print(f"Training run directory: {run_dir}")
+
     # 1. Create Environment
     env = gym.make('SimpleCausalIntersection-v0', render_mode='rgb_array')
     
@@ -226,11 +239,11 @@ def main():
     env = SafetyWrapper(env) # Hardcoded Safety Shield
     
     env = OverlayWrapper(env) # Adds text to render()
-    env = Monitor(env) # Tracks stats for SB3
+    env = Monitor(env, filename=os.path.join(run_dir, "monitor")) # Tracks stats for SB3
     
     # 3. Add Video Recorder
     # Trigger: Record every 30th episode
-    video_folder = 'videos_dqn_curved'
+    video_folder = os.path.join(run_dir, 'videos_dqn_curved')
     def video_trigger(episode_id):
         return episode_id % 30 == 0
         
@@ -244,30 +257,28 @@ def main():
     # 4. Initialize Agent
     # Create the agent
     model = DQN(
-        "MlpPolicy",
-        env,
-        learning_rate=linear_schedule(1e-4),
-        buffer_size=100000,
-        learning_starts=1000,
-        batch_size=32,
-        gamma=0.99,
-        # Exploration settings
-        exploration_fraction=0.4,  # Decay over first 40% of training
+        "MlpPolicy", 
+        env, 
+        verbose=1, 
+        learning_rate=1e-4, 
+        buffer_size=100000, 
+        learning_starts=1000, 
+        batch_size=64, 
+        tau=0.05, 
+        gamma=0.99, # Focus on future
+        train_freq=4, 
+        gradient_steps=1,
+        target_update_interval=1000,
+        exploration_fraction=0.4, # Explore longer
         exploration_initial_eps=1.0,
-        exploration_final_eps=0.01, # Only 1% random actions at the end
-        max_grad_norm=1.0,          # Prevent exploding gradients
-        policy_kwargs=dict(net_arch=[256, 256]), # User asked for dueling=True but standard DQN doesn't support it directly. Keeping net_arch to avoid error, or maybe I should risk it? User explicitly said: policy_kwargs=dict(dueling=True). I will assume they might be using a newer/custom version or just misunderstood. But to prevent crash I will comment it out or verify.
-        # Actually, let's look at the user snippet: policy_kwargs=dict(dueling=True).
-        # Standard SB3 DQN policy_kwargs -> 'dueling': False (default is True if using QRDQN?).
-        # Wait, SB3 DQN *policy* (MlpPolicy) does NOT have dueling argument.
-        # I will stick to safe net_arch but add a comment, OR check if I can assume 'dueling' support.
-        # Ideally I should use the Dueling script if they want Dueling.
-        # But for this file, I will use net_arch as before but Updated params.
-        verbose=1
+        exploration_final_eps=0.01, # Decay to 1%
+        max_grad_norm=1.0, # Cap gradients
+        policy_kwargs=dict(dueling=True), # Enable Dueling Network
+        tensorboard_log=os.path.join(run_dir, "tensorboard")
     )
     
     # Callbacks
-    viz_callback = VizCallback(viz_freq=30)
+    viz_callback = VizCallback(viz_freq=30, save_path=run_dir, plot_name="reward_plot.png")
     
     # Eval Callback (Best Model)
     from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
@@ -278,8 +289,8 @@ def main():
     
     eval_callback = EvalCallback(
         env,
-        best_model_save_path='./logs/best_model_dqn',
-        log_path='./logs/results_dqn',
+        best_model_save_path=os.path.join(run_dir, 'best_model_dqn'),
+        log_path=os.path.join(run_dir, 'results_dqn'),
         eval_freq=10000,
         deterministic=True,
         render=False,
@@ -287,18 +298,20 @@ def main():
     )
     
     # Chain callbacks
+    # Chain callbacks
+    # Removed StopTrainingOnRewardThreshold
     callbacks = [viz_callback, eval_callback]
     
     print("Starting DQN training (Curved Road)...")
-    print("Videos will be saved to ./videos_dqn_curved every 30 episodes")
-    print("Best model will be saved to ./logs/best_model_dqn")
+    print(f"Videos will be saved to {video_folder} every 30 episodes")
+    print(f"Best model will be saved to {os.path.join(run_dir, 'best_model_dqn')}")
     
     # Increased total steps to allow convergence
     model.learn(total_timesteps=600000, callback=callbacks)
     
     # 6. Save
-    model.save("dqn_simple_causal_curved")
-    print("Model saved to dqn_simple_causal_curved.zip")
+    model.save(os.path.join(run_dir, "dqn_simple_causal_curved"))
+    print(f"Model saved to {os.path.join(run_dir, 'dqn_simple_causal_curved.zip')}")
     
     # 7. Plot Rewards
     rewards = viz_callback.all_rewards
@@ -320,8 +333,8 @@ def main():
         plt.ylabel("Reward")
         plt.legend()
         plt.grid(True)
-        plt.savefig("reward_plot_dqn_curved.png")
-        print("Reward plot saved to reward_plot_dqn_curved.png")
+        plt.savefig(os.path.join(run_dir, "reward_plot_dqn_curved.png"))
+        print(f"Reward plot saved to {os.path.join(run_dir, 'reward_plot_dqn_curved.png')}")
     
     env.close()
     if plt.get_fignums():

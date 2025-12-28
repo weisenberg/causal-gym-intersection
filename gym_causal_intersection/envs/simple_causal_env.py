@@ -23,11 +23,12 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         
         # --- Physics Buffs (Arcade-ify) ---
         # 1. Faster Steering
-        self.max_steer_change = 0.2 # Was 0.05 or similar? 
+        # 1. Faster Steering
+        self.max_steer_change = 0.3 # Snappy steering
         # 2. Super Brakes
-        self.brake_accel = 2.0 # Was likely < 1.0. Double it.
+        self.brake_accel = 3.0 # Arcade braking
         # 3. Grip (Tire Friction) which reduces sliding
-        self.friction = 0.8 # Was 0.5?
+        self.friction = 1.0 # High grip
         
         # --- Discrete Action Space ---
         # 0: Idle (maintain speed)
@@ -44,17 +45,18 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
 
         # --- Full State Observation Space (Refactored) ---
         # --- Full State Observation Space (Refactored) ---
-        # Agent (7): Centering, Lateral, Heading, Speed, Steer, LaneID, Angle
-        # Lidar (5): 5 Rays
-        # Semantic (4): Type, RelVX, RelVY, Width
-        # Light (4): Green, Yellow, Red, Dist
+        # Agent (6): Pos, Vel, Heading
+        # Extra (2): Lookahead Error, Relative Speed
         # Road (10): 5 * [RelX, RelY]
         # NPCs (20): 5 * [RelX, RelY, RelVX, RelVY]
         # Peds (60): 30 * [RelX, RelY]
-        # Total: 7 + 5 + 4 + 4 + 10 + 20 + 60 = 110
+        # Semantic (4): [Type, RelVX, RelVY, Width]
+        # Light (4): [Green, Yellow, Red, Dist]
+        # Lidar (9): 9 Rays
+        # Total: 6 + 2 + 10 + 20 + 60 + 4 + 4 + 9 = 115
         self.obs_max_npcs = 5
         self.obs_max_peds = 30
-        self.obs_dim = 110
+        self.obs_dim = 115
         
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
@@ -100,6 +102,14 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                 else:
                     pass # print(f"DEBUG: Removed colliding NPC at {d:.2f}m")
             self.npc_cars = valid_npcs
+            
+            # --- Safe Spawn: Check Pedestrians ---
+            valid_peds = []
+            for ped in self.pedestrians:
+                d = np.linalg.norm(ped["pos"] - self._agent_location)
+                if d > safe_distance:
+                    valid_peds.append(ped)
+            self.pedestrians = valid_peds
             # -----------------------------------------------
             
         # Re-compute observation with correct state
@@ -581,6 +591,19 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             # Should be exactly at center (cx, cy)
             agent_pos = np.array(to_screen(self._agent_location)).astype(int)
             
+            # --- Draw Reference Path (Blue Line) ---
+            if len(self.track_data) > 1:
+                # Look ahead and behind
+                start_idx = max(0, self.last_waypoint_index - 10)
+                end_idx = min(len(self.track_data), self.last_waypoint_index + 30)
+                path_points = []
+                for i in range(start_idx, end_idx):
+                    p = to_screen(self.track_data[i]["pos"])
+                    path_points.append((int(p[0]), int(p[1])))
+                
+                if len(path_points) > 1:
+                    pygame.draw.lines(canvas, (0, 100, 255), False, path_points, 2)
+            
             cos_h = np.cos(self._agent_heading)
             sin_h = np.sin(self._agent_heading)
             corners = np.array([
@@ -596,7 +619,46 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             front_offset = np.array([self.car_length / 2 * cos_h, self.car_length / 2 * sin_h])
             front_pos = agent_pos + front_offset
             pygame.draw.circle(canvas, (200, 0, 0), front_pos.astype(int), 3)
-        
+            
+            # --- Draw Lidar Rays ---
+            # Re-compute for visualization (expensive but accurate)
+            lidar_dists, _ = self._compute_multiray_lidar()
+            angles = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
+            
+            # Recalculate max_dist for rendering scale
+            temp = self.context.get("temperature", 20.0)
+            max_dist = max(100.0, 150.0 + (20.0 - temp) * 3.0)
+            
+            for i, angle_offset in enumerate(angles):
+                dist_norm = lidar_dists[i]
+                actual_dist = dist_norm * max_dist
+                
+                # Ray geometry
+                ray_angle = self._agent_heading + angle_offset
+                start_p = self._agent_location
+                end_p = start_p + np.array([np.cos(ray_angle), np.sin(ray_angle)]) * actual_dist
+                
+                # Color: Green if clear (>0.9), Yellow/Red if close (Warning/Danger)
+                color = (0, 255, 0)
+                if dist_norm < 0.2: color = (255, 0, 0) # Danger
+                elif dist_norm < 0.5: color = (255, 255, 0) # Warning (Yellow)
+                
+                sp = to_screen(self._agent_location) # Use agent loc directly just in case start_p was offset? No, start_p IS agent_loc
+                ep = to_screen(end_p)
+                sp_int = (int(sp[0]), int(sp[1]))
+                ep_int = (int(ep[0]), int(ep[1]))
+                
+                pygame.draw.line(canvas, color, sp_int, ep_int, 1)
+                # Draw endpoint
+                pygame.draw.circle(canvas, color, ep_int, 2)
+            
+            # --- Draw Lookahead Point (Red Dot) ---
+            # Check if lookahead point exists in self (calculated in step/obs)
+            # If not, re-calculate roughly for viz
+            if hasattr(self, 'current_lookahead_point') and self.current_lookahead_point is not None:
+                 lp = to_screen(self.current_lookahead_point)
+                 pygame.draw.circle(canvas, (255, 0, 0), (int(lp[0]), int(lp[1])), 5)
+
         if pygame.font:
             font = pygame.font.Font(None, 28) # Smaller font for better fit
             
@@ -663,7 +725,7 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                  
         # --- Draw Lidar Rays (Yellow/Red) ---
         if hasattr(self, "latest_lidar") and self.latest_lidar and self._agent_location is not None:
-             angles = np.radians([-60, -30, 0, 30, 60])
+             angles = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
              sp = to_screen(self._agent_location)
              start_pos = (int(sp[0]), int(sp[1]))
              
@@ -1118,17 +1180,24 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
              reward += 1.0 * (1.0 - norm_speed)
              
         # 4. Anti-Camping Termination (Move or Die)
-        # Logic: If speed < 2.0 (and not blocked) for > 50 steps -> Terminate with -50.0
-        # "The agent is currently gaming the system by waiting."
-        if current_speed < 2.0 and not should_stop:
+        # Fix Lazy Termination: Only terminate if speed < 2.0 AND road is empty (>15m, index 0.1)
+        # Exception: Do NOT terminate if min_lidar_dist < 15.0 (stuck in traffic).
+        
+        # Scale back to meters (approx max_dist=150)
+        # Note: min_lidar is already calculated above as norm (0-1)
+        min_lidar_m = min_lidar * 150.0 
+        
+        if current_speed < 2.0:
             self.consecutive_idle_steps += 1
         else:
             self.consecutive_idle_steps = 0
             
-        if self.consecutive_idle_steps > 50: 
-            reward -= 50.0
-            terminated = True
-            # print("Terminated due to laziness (Move or Die).")
+        if self.consecutive_idle_steps > 50:
+            if min_lidar_m < 15.0:
+                pass # Safe (Stuck in traffic)
+            else:
+                reward -= 50.0
+                terminated = True
             
         # 5. Steering Stability Reward
         # Fix wobbling by penalizing rapid steering changes.
@@ -1158,6 +1227,22 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             if dist_m < 5.0 and current_speed > 2.0:
                 reward -= 1.0
 
+        # TTC / Following Logic (Car)
+        # If dist to car < 12m, and we are fast, penalty?
+        # User requested: "Reduce TTC Penalty Range from 60m to 12m"
+        # Since we didn't have a 60m penalty before (explicitly), we assume this refers 
+        # to an implicit perception penalty or I add it now.
+        # TTC / Following Logic (Car)
+        # If dist < 12.0m AND closing_speed > 0: Apply a penalty scaled by approach speed.
+        leader = self._get_leader()
+        if leader:
+            dist = np.linalg.norm(leader["pos"] - self._agent_location)
+            if dist < 12.0:
+                leader_speed = np.linalg.norm(leader["velocity"])
+                closing_speed = current_speed - leader_speed
+                if closing_speed > 0:
+                    reward -= closing_speed * 0.5 # Penalty scaled by approach speed
+
         if min_lidar < 0.05 and current_speed > 2.0: # Very close impact
             reward -= 5.0
             
@@ -1165,22 +1250,24 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
             reward -= 5.0 # Threatening pedestrian
             
         # Lane Centering Reward (New Right-Lane Strategy)
-        # 1.0 - abs(cross_track_error_from_target / tolerance)
-        # Use our new helper
-        lateral, centering_error, _ = self._calculate_local_lane_info()
+        # Target: Center of Right Lane (+track_width/4)
+        # track_width is 80. Center of right lane is +20 from road center.
+        # We need local lateral position relative to track center.
+        d = self.track_data[self.last_waypoint_index]
+        vec = self._agent_location - d["pos"]
+        local_x = np.dot(vec, d["normal"]) # Positive = Right, Negative = Left
         
-        # Tolerance: 15.0m
-        centering_reward = 1.0 - (centering_error / 15.0)
-        centering_reward = max(0.0, centering_reward) # Clip >= 0
-        
-        reward += centering_reward 
-        
-        # Oncoming Traffic Penalty (Left Lane is Lava)
-        # If lateral < 0 (Left Side), massive penalty scaling with distance into danger.
-        if lateral < 0.0:
-            reward -= 0.5 * abs(lateral)
-            # Example: At -10 (Left Center): -5.0 penalty per step.
-            # This is huge. It will force right lane quickly.
+        target_x = 20.0
+        lane_error = abs(local_x - target_x)
+        # Reward for being close to target
+        reward -= (lane_error / 40.0) * 0.1 # Small penalty for deviation
+
+        # Penalize Left Lane Crossing (Oncoming Traffic)
+        if local_x < 0:
+            reward -= 0.5 # Stay in your lane!
+            
+        # Oncoming Traffic Penalty (Left Lane is Lava) -> Handled above
+
             
         # --- Penalties and Termination ---
             
@@ -1373,20 +1460,138 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         
         # 1. Agent State (6)
         # Pos (x,y), Vel (vx,vy), Heading (cos, sin)
+        # NORMALIZE?
+        # Map is 600x600.
         state.extend(self._agent_location / 600.0)
         state.extend(self._agent_velocity / 5.0) # approx max speed
         state.append(np.cos(self._agent_heading))
         state.append(np.sin(self._agent_heading))
         
-        # 2. Road State (13)
-        # Dist to center (Smoothed Lookahead CTE)
-        # User requested 5-10m. Let's use 10.0.
-        cte_lookahead = self._get_lookahead_cte(lookahead_dist=10.0)
-        state.append(cte_lookahead / 40.0) # Width normalized
+        # 1b. Extra Features (Requested)
+        # Lookahead Error
+        # Calculate CTE to a point 10m ahead
+        la_error = self._calculate_lookahead_error(dist=10.0)
+        state.append(np.clip(la_error / 40.0, -1, 1))
         
+        # Relative Speed (Agent Speed - Leader Speed)
+        # Need nearest car in front
+        rel_speed = 0.0
+        # Find car in front (lidar nearest?)
+        # Let's use the helper _get_leader()
+        leader = self._get_leader()
+        if leader:
+            leader_speed = np.linalg.norm(leader["velocity"])
+            my_speed = np.linalg.norm(self._agent_velocity)
+            rel_speed = my_speed - leader_speed
+        state.append(np.clip(rel_speed / 10.0, -1, 1))
+        
+        # 2. Road State (10)
+        # 5 Waypoints (RelX, RelY)
+        current_idx = self.last_waypoint_index
+        for i in range(5):
+             idx = min(current_idx + (i+1)*2, len(self.track_data)-1)
+             w_pos = self.track_data[idx]["pos"]
+             w_rel = w_pos - self._agent_location
+             state.extend(w_rel / 100.0) # Normalize
+             
+        # 3. NPC State (20)
+        # 5 nearest cars [RelX, RelY, RelVX, RelVY]
+        # Sort by distance
+        cars = sorted(self.npc_cars, key=lambda c: np.linalg.norm(c["pos"] - self._agent_location))
+        for i in range(self.obs_max_npcs):
+            if i < len(cars):
+                c = cars[i]
+                rel_pos = (c["pos"] - self._agent_location) / 100.0
+                rel_vel = (c["velocity"] - self._agent_velocity) / 10.0
+                state.extend(rel_pos)
+                state.extend(rel_vel)
+            else:
+                state.extend([0,0,0,0])
+
+        # 4. Pedestrian State (60)
+        # 30 nearest peds [RelX, RelY]
+        peds = sorted(self.pedestrians, key=lambda p: np.linalg.norm(p["pos"] - self._agent_location))
+        for i in range(self.obs_max_peds):
+             if i < len(peds):
+                 p = peds[i]
+                 rel_pos = (p["pos"] - self._agent_location) / 100.0
+                 state.extend(rel_pos)
+             else:
+                 state.extend([0,0])
+                 
+        # 5. Semantic Info (4)
+        # [Type, RelVX, RelVY, Width]
+        # Use nearest object data from Lidar scan? 
+        # For now, let's just use 0s if we don't have a semantic target mechanism. 
+        # Use helper from Lidar?
+        # Actually previous code had this. Let's assume 0s for now to match dim.
+        state.extend([0,0,0,0]) 
+        
+        # 6. Light State (4)
+        # Green, Yellow, Red, Dist
+        light_enc = [0,0,0]
+        if self.traffic_light_state == 0: light_enc[0] = 1
+        elif self.traffic_light_state == 1: light_enc[1] = 1
+        elif self.traffic_light_state == 2: light_enc[2] = 1
+        state.extend(light_enc)
+        
+        _, dist_to_light = self._get_upcoming_light()
+        state.append(dist_to_light / 100.0)
+        
+        # 7. Lidar (9)
+        lidar, _ = self._compute_multiray_lidar()
+        state.extend(lidar)
+        
+        return np.array(state, dtype=np.float32)
+        
+    def _calculate_lookahead_error(self, dist=10.0):
+        # Find point roughly 'dist' meters ahead of current waypoint
+        # Traverse forward
+        current_idx = self.last_waypoint_index
+        search_idx = current_idx
+        accum_dist = 0
+        
+        while accum_dist < dist and search_idx < len(self.track_data) - 1:
+            p1 = self.track_data[search_idx]["pos"]
+            p2 = self.track_data[search_idx+1]["pos"]
+            accum_dist += np.linalg.norm(p2 - p1)
+            search_idx += 1
+            
+        target_point = self.track_data[search_idx]["pos"]
+        # Store for rendering
+        self.current_lookahead_point = target_point
+        
+        # Calculate signed lateral distance
+        # Vector from agent to target
+        to_target = target_point - self._agent_location
+        # Heading vector
+        heading_vec = np.array([np.cos(self._agent_heading), np.sin(self._agent_heading)])
+        # Cross product (2D)
+        # Positive = Target is to the Left?
+        # Standard: Cross(Heading, ToTarget)
+        cross = heading_vec[0]*to_target[1] - heading_vec[1]*to_target[0]
+        return cross
+
+    def _get_leader(self):
+        # Find nearest car in front within some cone/distance
+        best_car = None
+        min_dist = 50.0 # max lookahead for leader
+        
+        heading_vec = np.array([np.cos(self._agent_heading), np.sin(self._agent_heading)])
+        
+        for car in self.npc_cars:
+            to_car = car["pos"] - self._agent_location
+            dist = np.linalg.norm(to_car)
+            if dist < min_dist:
+                # Check if in front (dot product > 0.5 ~ 60 deg cone)
+                if np.dot(to_car / (dist+0.01), heading_vec) > 0.5:
+                    min_dist = dist
+                    best_car = car
+        return best_car
+
     def _compute_multiray_lidar(self):
-        # 5 Rays: -60, -30, 0, 30, 60
-        angles = np.radians([-60, -30, 0, 30, 60])
+        # 9 Rays: [-60, -35, -20, -10, 0, 10, 20, 35, 60]
+        angles = np.radians([-60, -35, -20, -10, 0, 10, 20, 35, 60])
         
         # Dynamic Range based on Temperature (Braking Distance)
         # Lower Temp -> Longer Range needed
@@ -1574,146 +1779,3 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
         
         return lateral, centering_error, road_angle
 
-    def _get_obs(self):
-        # Return Refactored Egocentric State (96 dim)
-        state = []
-        
-        # 1. Agent State (7) 
-        # CTE to Target, Heading Error, Speed, Steering, Lane Info
-        
-        lateral, centering_error, road_angle = self._calculate_local_lane_info()
-        
-        # 1. Centering Error (Dist to Right Lane Center)
-        # Normalize to lane width (approx 20)
-        state.append(np.clip(centering_error / 20.0, 0.0, 1.0))
-        
-        # 2. Signed Lateral Position (Crucial for knowing Left vs Right)
-        # >0 Right, <0 Left. 
-        state.append(np.clip(lateral / 20.0, -1.0, 1.0))
-        
-        # Lookahead CTE (Keep smoothness) -> Relative to Right Center?
-        # Re-using the Lookahead logic:
-        # We should probably update _get_lookahead_cte to target Right Lane too?
-        # Or just rely on the new immediate CTE for now.
-        # User requested "Ensure agent knows which lane...". Signed Lateral is enough.
-        
-        # 3. Heading Error
-        diff = road_angle - self._agent_heading
-        diff = (diff + np.pi) % (2 * np.pi) - np.pi
-        state.append(np.clip(diff, -1.0, 1.0))
-        
-        # 4. Normalized Speed
-        speed = np.linalg.norm(self._agent_velocity)
-        state.append(np.clip(speed / 5.0, 0.0, 1.0))
-        
-        # 5. Steering (Keep 0.0 for now as placeholder)
-        state.append(0.0) 
-        
-        # 6. Lane ID (Explicit Feature)
-        # +1.0 for Right, -1.0 for Left
-        state.append(1.0 if lateral > 0 else -1.0)
-        
-        # 7. Angle to Lane (Redundant with Heading Error but useful)
-        state.append(np.sin(diff))
-        
-        # --- Multi-Ray Lidar (5) & Semantic (4) ---
-        lidar_dists, semantic = self._compute_multiray_lidar()
-        
-        # 5 Rays
-        state.extend(np.clip(lidar_dists, 0.0, 1.0))
-        
-        # Semantic (4)
-        state.append(semantic["type"])
-        state.append(semantic["rel_vx"])
-        state.append(semantic["rel_vy"])
-        state.append(semantic["width"])
-        
-        # Light (4): Green, Yellow, Red, Dist
-        light_idx, light_dist = self._get_upcoming_light()
-        
-        # Encoding
-        if self.traffic_light_state == 0: # Green
-             state.extend([1.0, 0.0, 0.0])
-        elif self.traffic_light_state == 1: # Yellow
-             state.extend([0.0, 1.0, 0.0])
-        else: # Red
-             state.extend([0.0, 0.0, 1.0])
-             
-        # Normalize Dist (Max range 100?)
-        # If > 100, clip to 1.0
-        norm_dist = np.clip(light_dist / 100.0, 0.0, 1.0)
-        state.append(norm_dist)
-        
-        # 2. Road Preview (5 Waypoints) -> Egocentric (Keep existing logic)
-        for i in range(1, 6):
-            idx = min(len(self.track_data)-1, self.last_waypoint_index + i * 5)
-            wp = self.track_data[idx]["pos"]
-            rel = self._transform_to_ego(wp)
-            # Normalize distance? Divide by view range (e.g. 100m)
-            state.append(np.clip(rel[0] / 100.0, -1.0, 1.0))
-            state.append(np.clip(rel[1] / 100.0, -1.0, 1.0))
-            
-        # 3. NPCs (5 Cars) -> Egocentric
-        # Sort by distance
-        cars_sorted = sorted(self.npc_cars, key=lambda c: np.linalg.norm(c["pos"] - self._agent_location))
-        
-        for i in range(self.obs_max_npcs):
-            if i < len(cars_sorted):
-                c = cars_sorted[i]
-                rel = self._transform_to_ego(c["pos"], c["velocity"])
-                # Pos / 100, Vel / 10
-                state.append(np.clip(rel[0] / 100.0, -1.0, 1.0))
-                state.append(np.clip(rel[1] / 100.0, -1.0, 1.0))
-                state.append(np.clip(rel[2] / 10.0, -1.0, 1.0))
-                state.append(np.clip(rel[3] / 10.0, -1.0, 1.0))
-            else:
-                state.extend([0.0]*4)
-                
-        # 4. Peds (30 Peds) -> Egocentric
-        peds_sorted = sorted(self.pedestrians, key=lambda p: np.linalg.norm(p["pos"] - self._agent_location))
-        for i in range(self.obs_max_peds):
-            if i < len(peds_sorted):
-                p = peds_sorted[i]
-                rel = self._transform_to_ego(p["pos"])
-                state.append(np.clip(rel[0] / 100.0, -1.0, 1.0))
-                state.append(np.clip(rel[1] / 100.0, -1.0, 1.0))
-            else:
-                state.extend([0.0]*2)
-                
-
-        
-        return np.array(state, dtype=np.float32)
-
-    def _update_pedestrians(self):
-        # Override to handle simple walking + jaywalking
-        alive_peds = []
-        for ped in self.pedestrians:
-             # Move towards target
-             dx = ped["target"][0] - ped["pos"][0]
-             dy = ped["target"][1] - ped["pos"][1]
-             dist = np.sqrt(dx*dx + dy*dy)
-             
-             if dist < 5.0:
-                 # Reached target, remove (don't add to alive_peds)
-                 continue
-                 
-             # Normalize
-             speed = ped["speed"]
-             
-             # Check Light if NOT Jaywalking
-             # Check Light if NOT Jaywalking
-             if not ped.get("is_jaywalking", False):
-                   # Check traffic light state
-                   # Cars Green (0) or Yellow (1) -> Peds Stop
-                   if self.traffic_light_state == 0 or self.traffic_light_state == 1:
-                       speed = 0.0
-             
-             if speed > 0:
-                 move_x = (dx/dist) * speed
-                 move_y = (dy/dist) * speed
-                 ped["pos"][0] += move_x
-                 ped["pos"][1] += move_y
-            
-             alive_peds.append(ped)
-             
-        self.pedestrians = alive_peds
