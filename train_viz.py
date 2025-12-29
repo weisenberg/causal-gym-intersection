@@ -135,6 +135,28 @@ class OverlayWrapper(gym.Wrapper):
         # Convert back to numpy
         return np.array(image)
 
+class EpisodeCheckpointCallback(BaseCallback):
+    def __init__(self, check_freq: int, save_path: str, verbose=1):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.save_path = save_path
+        self.episodes = 0
+        
+    def _init_callback(self) -> None:
+        # Create folder if needed
+        if self.save_path is not None:
+            os.makedirs(self.save_path, exist_ok=True)
+            
+    def _on_step(self) -> bool:
+        if self.locals['dones'][0]:
+            self.episodes += 1
+            if self.episodes % self.check_freq == 0:
+                path = os.path.join(self.save_path, f"model_ep_{self.episodes}")
+                self.model.save(path)
+                if self.verbose > 0:
+                    print(f"Saved checkpoint to {path}")
+        return True
+
 class VizCallback(BaseCallback):
     def __init__(self, viz_freq=100, save_path=".", plot_name="reward_plot_ppo_curved.png"):
         super().__init__()
@@ -256,9 +278,9 @@ def main():
     )
     
     # 4. Initialize Agent
-    # Use linear decay schedule (3e-4 -> 0.0)
+    # Use linear decay schedule (5e-4 -> 0.0)
     # New schedule takes ONE arg (initial_value)
-    lr_schedule = linear_schedule(3e-4)
+    lr_schedule = linear_schedule(5e-4)
     
     model = PPO(
         "MlpPolicy", 
@@ -271,6 +293,7 @@ def main():
         batch_size=64,
         n_steps=2048,
         gamma=0.99,
+        policy_kwargs=dict(net_arch=[256, 256]), # Bigger brain for 9-ray input
         tensorboard_log=os.path.join(run_dir, "tensorboard")
     )
     
@@ -299,6 +322,8 @@ def main():
         deterministic=True,
         render=False
     )
+    
+    # Removed EpisodeCheckpointCallback per strict Refactor request
     
     # Removed StopTrainingOnRewardThreshold
     callbacks = [viz_callback, eval_callback]

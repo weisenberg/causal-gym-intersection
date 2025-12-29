@@ -9,6 +9,67 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
 from gymnasium.wrappers import RecordVideo
+from stable_baselines3.dqn.policies import DQNPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import torch.nn as nn
+import torch
+
+# --- DUELING DQN ARCHITECTURE ---
+class DuelingQNetwork(nn.Module):
+    def __init__(self, observation_space, action_space, features_extractor, features_dim,
+                 net_arch=None, activation_fn=nn.ReLU, normalize_images=True):
+        super().__init__()
+        self.features_extractor = features_extractor
+        self.features_dim = features_dim
+        self.activation_fn = activation_fn
+        action_dim = action_space.n
+        
+        if net_arch is None: net_arch = [256, 256]
+            
+        self.shared_net = nn.Sequential()
+        input_dim = features_dim
+        for i, layer_size in enumerate(net_arch):
+            self.shared_net.add_module(f"fc_{i}", nn.Linear(input_dim, layer_size))
+            self.shared_net.add_module(f"act_{i}", activation_fn())
+            input_dim = layer_size
+            
+        self.value_stream = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            activation_fn(),
+            nn.Linear(128, 1)
+        )
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            activation_fn(),
+            nn.Linear(128, action_dim)
+        )
+        
+    def forward(self, obs):
+        features = self.features_extractor(obs)
+        shared_out = self.shared_net(features)
+        values = self.value_stream(shared_out)
+        advantages = self.advantage_stream(shared_out)
+        return values + (advantages - advantages.mean(dim=1, keepdim=True))
+
+    def set_training_mode(self, mode: bool) -> None:
+        self.train(mode)
+
+    def _predict(self, observation: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        q_values = self(observation)
+        action = q_values.argmax(dim=1).reshape(-1)
+        return action
+
+class DuelingDQNPolicy(DQNPolicy):
+    def make_q_net(self):
+        net_args = {
+            "observation_space": self.observation_space,
+            "action_space": self.action_space,
+            "net_arch": self.net_arch,
+            "activation_fn": self.activation_fn,
+            "normalize_images": self.normalize_images
+        }
+        net_args = self._update_features_extractor(net_args, features_extractor=None)
+        return DuelingQNetwork(**net_args).to(self.device)
 
 pygame.init()
 pygame.font.init()
@@ -135,6 +196,42 @@ class OverlayWrapper(gym.Wrapper):
         # Convert back to numpy
         return np.array(image)
 
+class DiscreteWrapper(gym.ActionWrapper):
+    """
+    Wrapper to convert Discrete actions to Continuous [accel, steer] for DQN validation.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        # 0: Hard Brake, 1: Cruise, 2: Accel, 3: Left, 4: Right, 5: Hard Left, 6: Hard Right
+        self.action_space = gym.spaces.Discrete(7)
+        
+    def action(self, action):
+        # Map Discrete(0..6) to Continuous [accel, steer]
+        # Handle numpy scalars
+        if hasattr(action, 'item'):
+            action = action.item()
+            
+        if action == 0:   # Hard Brake
+            return np.array([-1.0, 0.0], dtype=np.float32)
+        elif action == 1: # Cruise
+            return np.array([0.0, 0.0], dtype=np.float32)
+        elif action == 2: # Accelerate
+            return np.array([1.0, 0.0], dtype=np.float32)
+        elif action == 3: # Steer Left
+            # User Reqs: Acc=0.5, Steer=-0.5
+            return np.array([0.5, -0.5], dtype=np.float32)
+        elif action == 4: # Steer Right
+            # User Reqs: Acc=0.5, Steer=0.5
+            return np.array([0.5, 0.5], dtype=np.float32)
+        elif action == 5: # Hard Left
+            # User Reqs: Acc=0.2, Steer=-1.0
+            return np.array([0.2, -1.0], dtype=np.float32)
+        elif action == 6: # Hard Right
+            # User Reqs: Acc=0.2, Steer=1.0
+            return np.array([0.2, 1.0], dtype=np.float32)
+        # Default safety
+        return np.array([0.0, 0.0], dtype=np.float32)
+
 class VizCallback(BaseCallback):
     def __init__(self, viz_freq=100, save_path=".", plot_name="reward_plot_dqn_curved.png"):
         super().__init__()
@@ -236,7 +333,12 @@ def main():
     
     # 2. Add Wrappers
     from gym_causal_intersection.wrappers.safety_wrapper import SafetyWrapper
-    env = SafetyWrapper(env) # Hardcoded Safety Shield
+    
+    # Order: Agent -> DiscreteWrapper -> SafetyWrapper -> Env
+    # SafetyWrapper sees Continuous Actions produced by DiscreteWrapper
+    
+    env = SafetyWrapper(env) 
+    env = DiscreteWrapper(env)
     
     env = OverlayWrapper(env) # Adds text to render()
     env = Monitor(env, filename=os.path.join(run_dir, "monitor")) # Tracks stats for SB3
@@ -257,7 +359,7 @@ def main():
     # 4. Initialize Agent
     # Create the agent
     model = DQN(
-        "MlpPolicy", 
+        DuelingDQNPolicy, 
         env, 
         verbose=1, 
         learning_rate=1e-4, 
@@ -267,28 +369,34 @@ def main():
         tau=0.05, 
         gamma=0.99, # Focus on future
         train_freq=4, 
-        gradient_steps=1,
+        gradient_steps=1, # User Req
         target_update_interval=1000,
-        exploration_fraction=0.4, # Explore longer
+        exploration_fraction=0.4, # User Req: 0.4
         exploration_initial_eps=1.0,
         exploration_final_eps=0.01, # Decay to 1%
         max_grad_norm=1.0, # Cap gradients
-        policy_kwargs=dict(dueling=True), # Enable Dueling Network
+        policy_kwargs=dict(net_arch=[256, 256]), # User Req: Dueling is implicit in Policy class
         tensorboard_log=os.path.join(run_dir, "tensorboard")
     )
     
     # Callbacks
-    viz_callback = VizCallback(viz_freq=30, save_path=run_dir, plot_name="reward_plot.png")
+    viz_callback = VizCallback(viz_freq=30, save_path=run_dir, plot_name="reward_plot_dqn.png")
     
     # Eval Callback (Best Model)
     from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
     
+    # Needs a separate Eval Env with same wrappers!
+    eval_env = gym.make('SimpleCausalIntersection-v0', render_mode=None)
+    eval_env = SafetyWrapper(eval_env)
+    eval_env = DiscreteWrapper(eval_env)
+    eval_env = Monitor(eval_env)
+
     # Save best model to ./logs/best_model
     # Check every 10,000 steps
     stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=10, min_evals=5, verbose=1)
     
     eval_callback = EvalCallback(
-        env,
+        eval_env,
         best_model_save_path=os.path.join(run_dir, 'best_model_dqn'),
         log_path=os.path.join(run_dir, 'results_dqn'),
         eval_freq=10000,
