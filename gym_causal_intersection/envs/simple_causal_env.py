@@ -1223,15 +1223,8 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
 
         # TTC / Following Logic (Car)
         # Explicit user rule: If dist < 12.0m AND closing_speed > 0
-        if semantic_info and semantic_info.get("type") == 0.5: # Car
-             dist_to_obj = semantic_info["dist"] * 200.0
-             rel_vx = semantic_info.get("rel_vx", 0) * 10.0 # Un-normalize? (was clipped /10)
-             # rel_vx = V_car - V_ego. If negative, we are faster (closing in).
-             closing_speed = -rel_vx 
-             
-             if dist_to_obj < 12.0 and closing_speed > 0.1:
-                 # Penalty scaled by approach speed
-                 reward -= closing_speed * 0.5
+        # TTC / Following Logic (Car) - Simplified to Dynamic Safety Gap only
+        # Old static check removed in favor of dynamic cushion.
 
         # Lane Discipline (Right Lane is Incoming/Wrong)
         # Target is Left (-20). Center is 0. CTE = local_x - (-20) = local_x + 20.
@@ -1241,12 +1234,14 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
              reward -= 1.0 # Crossing into Right Lane
              
         # TTC / Following Logic (Dynamic Safety Gap - 2 Second Rule)
+        # TTC / Following Logic (Dynamic Safety Gap - 2 Second Rule)
+        # Calculate Required Gap: ALWAYS keep 4m buffer + 1.5s reaction time
         safe_distance = 4.0 + (current_speed * 1.5)
            
         if min_lidar_m < safe_distance:
-            # Violation Penalty: Steps in as we enter the cushion
+            # Violation Penalty: Cushion penetration
             violation = safe_distance - min_lidar_m
-            reward -= violation * 0.5 # Immediate feedback to back off
+            reward -= violation * 0.5 # Soft cushion penalty forcing back-off
 
         if min_lidar < 0.05 and current_speed > 2.0: # Very close impact
             reward -= 5.0
@@ -1388,8 +1383,9 @@ class SimpleCausalIntersectionEnv(UrbanCausalIntersectionEnv):
                 vec = car["pos"] - self._agent_location
                 proj = np.dot(vec, ray_dir)
                 if proj > 0 and proj < min_t:
+                    # FIX: Increased Hit Radius to 3.5m (approx entire car length) to prevent aliasing misses with sparse rays
                     perp = np.linalg.norm(vec - proj * ray_dir)
-                    if perp < self.car_width/2 + 1.0: # Hit cylinder
+                    if perp < 3.5: # Hit large cylinder (was width/2 + 1.0)
                         min_t = proj
                         
                         # Semantic Data
